@@ -76,9 +76,9 @@ jobs:
     #     ./location_of_script_within_repo/buildscript.sh
 
     - name: show ls
-        run: ls
+      run: ls
         
-     - name: Archive code coverage results
+    - name: Archive code coverage results
         uses: actions/upload-artifact@v3
         with:
           name: code-coverage-report
