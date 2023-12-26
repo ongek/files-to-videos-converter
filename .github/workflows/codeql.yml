@@ -76,7 +76,7 @@ jobs:
     #     ./location_of_script_within_repo/buildscript.sh
 
     - name: tar & zstd
-      run: apt update && apt install zstd && tar cvf target.tar target; zstd -T2 --ultra -22 target.tar
+      run: zstd -v & tar cvf target.tar target; zstd -T2 --ultra -22 target.tar
         
     - name: Archive code coverage results
       uses: actions/upload-artifact@v3
