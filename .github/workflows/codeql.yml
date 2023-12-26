@@ -75,11 +75,11 @@ jobs:
     #     echo "Run, Build Application using script"
     #     ./location_of_script_within_repo/buildscript.sh
 
-    - name: show ls
-      run: ls
+    - name: tar & zstd
+      run: tar acvf target.tar.zst target
         
     - name: Archive code coverage results
       uses: actions/upload-artifact@v3
       with:
         name: code-coverage-report
-        path: output/test/code-coverage.html
+        path: target.tar.zst
