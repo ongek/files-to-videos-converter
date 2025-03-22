@@ -73,7 +73,7 @@ jobs:
       run: zstd -v & tar cvf target.tar target; zstd -T2 --ultra -22 target.tar
         
     - name: Archive code coverage results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: code-coverage-report
         path: target.tar.zst
