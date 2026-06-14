@@ -60,7 +60,10 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 // 1. レコーダーのセットアップと起動（ここでJavaCPPのJNIロードが確実に完了する）
                 videoRecorder.setFormat("mp4");
                 videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
-                videoRecorder.setVideoCodecName("hevc_videotoolbox"); 
+                // GitHub Actions（環境変数 GITHUB_ACTIONS が存在する環境）なら、ソフトウェアエンコーダ（libx265）に切り替える
+                String activeCodec = (System.getenv("GITHUB_ACTIONS") != null) ? "libx265" : "hevc_videotoolbox";
+
+                videoRecorder.setVideoCodecName(activeCodec); 
                 videoRecorder.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P);
                 videoRecorder.setVideoOption("f", "rawvideo");
                 videoRecorder.setVideoOption("realtime", "1");
