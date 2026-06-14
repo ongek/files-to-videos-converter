@@ -116,7 +116,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
      * @param videoRecorder - ffmpeg recorder
      * @throws FFmpegFrameRecorder.Exception - if recorder can't be started
      */
-    private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
+private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
         videoRecorder.setFormat("mp4");
         videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
         
@@ -124,28 +124,45 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
 
         videoRecorder.setVideoOption("f", "rawvideo");
-        
         videoRecorder.setVideoOption("realtime", "1");
-
-        // ==========================================
-        // 【hvc1 強制上書きの確定版ロジック】
-        // ==========================================
-        // アプローチ1: コンテナ側ではなく、ビデオコーデック側の内部プロパティとして
-        // `-vtag hvc1` 相当の挙動を直接流し込みます。
-        videoRecorder.setVideoOption("vtag", "hvc1");
-
-        // アプローチ2: それでも通らない場合に備え、
-        // 出力ストリーム全体のグローバルなメタデータ（FourCCコード）として明示的にインジェクションします。
-        videoRecorder.setOption("vtag", "hvc1");
-        videoRecorder.setOption("video_tag", "hvc1");
-        // ==========================================
-
-        videoRecorder.setVideoBitrate(8000000); // 8Mbps（前回の動作に合わせて固定）
+        videoRecorder.setVideoBitrate(8000000); // 8Mbps
 
         videoRecorder.setAudioChannels(0);
         videoRecorder.setSampleRate(0);
 
+        // -----------------------------------------------------------------
+        // 【超強力・解決策】内部構造体を直接ハックして hvc1 を強制注入する
+        // -----------------------------------------------------------------
+        // start() を呼ぶ前に、コンテナ自体のグローバルオプションとしてメタデータを指定（保険）
+        videoRecorder.setOption("movflags", "faststart");
+
+        // 一度レコーダーをスタートさせ、内部構造体（AVFormatContext等）をメモリ上に生成させる
         videoRecorder.start();
+
+        // スタート直後、エンコードが本格的に始まる前にC言語レイヤーのポインタを直接書き換える
+        try {
+            // 1. FFmpegFrameRecorder から生の AVFormatContext を取得
+            org.bytedeco.ffmpeg.avformat.AVFormatContext oc = videoRecorder.getFormatContext();
+            
+            if (oc != null && oc.nb_streams() > 0) {
+                // 2. 最初のストリーム（ビデオストリーム）の構造体を取得
+                org.bytedeco.ffmpeg.avformat.AVStream videoStream = oc.streams(0);
+                
+                if (videoStream != null && videoStream.codecpar() != null) {
+                    // 3. コーデックパラメータの codec_tag (FourCC) を直接書き換える
+                    // 'h'(0x68), 'v'(0x76), 'c'(0x63), '1'(0x31) 
+                    // リトルエンディアンの32ビット整数値： 0x31637668
+                    int hvc1Tag = 0x31637668; 
+                    
+                    // ストリームクラスとパラメータクラスの両方のタグを「hvc1」に書き換え
+                    videoStream.codecpar().codec_tag(hvc1Tag);
+                    
+                    log.info("Successfully injected 'hvc1' tag directly into FFmpeg native native layer.");
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to inject hvc1 tag via native pointer, falling back to default.", e);
+        }
     }
 
     /**
