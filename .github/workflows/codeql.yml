@@ -26,10 +26,9 @@ jobs:
     - name: Tar & Zstd compression
       run: |
         tar cvf target.tar target
-        zstd -T0 --max target.tar -o target.tar.zst
 
     - name: Archive Build Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: FilesToVideosConverter-macos-arm64
-        path: target.tar.zst
+        path: target.tar
