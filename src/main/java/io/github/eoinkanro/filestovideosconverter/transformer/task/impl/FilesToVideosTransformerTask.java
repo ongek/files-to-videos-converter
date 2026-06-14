@@ -130,38 +130,38 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
         videoRecorder.setAudioChannels(0);
         videoRecorder.setSampleRate(0);
 
-        // -----------------------------------------------------------------
-        // 【超強力・解決策】内部構造体を直接ハックして hvc1 を強制注入する
-        // -----------------------------------------------------------------
-        // start() を呼ぶ前に、コンテナ自体のグローバルオプションとしてメタデータを指定（保険）
+        // Apple互換性を高める高速起動フラグ（コンテナレベルの設定はstart前に通るケースがあります）
         videoRecorder.setOption("movflags", "faststart");
 
-        // 一度レコーダーをスタートさせ、内部構造体（AVFormatContext等）をメモリ上に生成させる
+        // 1. まず通常通りスタートさせて内部構造体を初期化させる
         videoRecorder.start();
 
-        // スタート直後、エンコードが本格的に始まる前にC言語レイヤーのポインタを直接書き換える
+        // 2. リフレクションを使って FFmpegFrameRecorder の内部フィールド "oc" (AVFormatContext) を強引に奪い取る
         try {
-            // 1. FFmpegFrameRecorder から生の AVFormatContext を取得
-            org.bytedeco.ffmpeg.avformat.AVFormatContext oc = videoRecorder.getFormatContext();
+            // FFmpegFrameRecorderクラスの "oc" フィールドを取得
+            java.lang.reflect.Field ocField = FFmpegFrameRecorder.class.getDeclaredField("oc");
+            ocField.setAccessible(true); // private/protected の制限を解除
+            
+            // インスタンスから実際のオブジェクト（AVFormatContext）を取り出す
+            org.bytedeco.ffmpeg.avformat.AVFormatContext oc = 
+                (org.bytedeco.ffmpeg.avformat.AVFormatContext) ocField.get(videoRecorder);
             
             if (oc != null && oc.nb_streams() > 0) {
-                // 2. 最初のストリーム（ビデオストリーム）の構造体を取得
+                // 最初のビデオストリームを取得
                 org.bytedeco.ffmpeg.avformat.AVStream videoStream = oc.streams(0);
                 
                 if (videoStream != null && videoStream.codecpar() != null) {
-                    // 3. コーデックパラメータの codec_tag (FourCC) を直接書き換える
-                    // 'h'(0x68), 'v'(0x76), 'c'(0x63), '1'(0x31) 
-                    // リトルエンディアンの32ビット整数値： 0x31637668
+                    // 'hvc1' の FourCC 32bit整数値 (0x31637668)
                     int hvc1Tag = 0x31637668; 
                     
-                    // ストリームクラスとパラメータクラスの両方のタグを「hvc1」に書き換え
+                    // ネイティブ構造体のタグを直接上書き
                     videoStream.codecpar().codec_tag(hvc1Tag);
                     
-                    log.info("Successfully injected 'hvc1' tag directly into FFmpeg native native layer.");
+                    log.info("Successfully bypassed JavaCV encapsulation and injected 'hvc1' tag via reflection.");
                 }
             }
         } catch (Exception e) {
-            log.warn("Failed to inject hvc1 tag via native pointer, falling back to default.", e);
+            log.warn("Failed to reflectively inject hvc1 tag. Video might fall back to hev1.", e);
         }
     }
 
