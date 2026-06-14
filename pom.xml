@@ -16,7 +16,9 @@
     <version>1.1.0</version>
 
     <properties>
-        <java.version>20</java.version>
+        <java.version>26</java.version> 
+        <javacv.version>1.5.13</javacv.version>
+        <ffmpeg.version>8.0.1-1.5.13</ffmpeg.version>
     </properties>
 
     <dependencies>
@@ -41,15 +43,18 @@
             <artifactId>commons-cli</artifactId>
             <version>1.11.0</version>
         </dependency>
+
         <dependency>
             <groupId>org.bytedeco</groupId>
-            <artifactId>javacv-platform</artifactId>
-            <version>1.5.13</version>
+            <artifactId>javacv</artifactId>
+            <version>${javacv.version}</version>
         </dependency>
+
         <dependency>
             <groupId>org.bytedeco</groupId>
-            <artifactId>ffmpeg-platform-gpl</artifactId>
-            <version>8.0.1-1.5.13</version>
+            <artifactId>ffmpeg</artifactId>
+            <version>${ffmpeg.version}</version>
+            <classifier>macosx-arm64</classifier>
         </dependency>
 
         <dependency>
@@ -58,6 +63,7 @@
             <version>3.0.0-beta3</version>
         </dependency>
     </dependencies>
+
     <build>
         <finalName>FilesToVideosConverter</finalName>
         <plugins>
@@ -72,5 +78,4 @@
             </plugin>
         </plugins>
     </build>
-
 </project>
