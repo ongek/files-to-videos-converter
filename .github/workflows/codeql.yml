@@ -1,34 +1,85 @@
-name: "Native Mac ARM64 Lightweight Build"
+name: Verify Converter Integrity
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # 手動実行トリガー
 
 jobs:
-  build:
-    name: Build JAR (Mac ARM64)
-    runs-on: macos-latest
-    
+  build-and-verify:
+    runs-on: macos-latest # Apple Silicon環境 (hevc_videotoolbox) を利用するためmacOSを指定
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup Java JDK 26
+    - name: Set up JDK 26
       uses: actions/setup-java@v4
       with:
         java-version: '26'
-        distribution: 'temurin'
+        distribution: 'oracle' # もし他に使用したいディストリビューションがあれば変更してください
         cache: 'maven'
 
     - name: Build with Maven
       run: mvn clean package -DskipTests
 
-    - name: Tar & Zstd compression
+    - name: Prepare Test Workspace
       run: |
-        tar cvf target.tar target
+        mkdir -p test_workspace/in
+        mkdir -p test_workspace/out
+        mkdir -p test_workspace/dec
+        
+        # 1. 整合性検証用のランダムデータ（1MB）をテスト入力ファイルとして自動生成
+        dd if=/dev/urandom of=test_workspace/in/integrity_test_source.dat bs=1024 count=1024
+        
+        # 生成したファイルのハッシュ値（正解データ）を記録
+        echo "=== SOURCE FILE SHA-256 ==="
+        shasum -a 256 test_workspace/in/integrity_test_source.dat | tee test_workspace/source_hash.txt
 
-    - name: Archive Build Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: FilesToVideosConverter-macos-arm64
-        path: target.tar
+    - name: Execute Files-To-Videos Conversion (Encode)
+      run: |
+        # 2. 生成されたJARを実行して「ファイル -> 動画」へ変換
+        # 引数やパスの設定は実際のプロジェクト構造に合わせて適宜調整してください
+        java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -ftv -fp test_workspace/in
+        
+        # 生成された動画をoutディレクトリに退避（※出力先の仕様に合わせて調整してください）
+        # もし自動で同階層や別フォルダに書き出される場合はmvコマンドで集約します
+        echo "=== VIDEO GENERATED ==="
+        ls -la test_workspace/
+
+    - name: Execute Videos-To-Files Conversion (Decode)
+      run: |
+        # 3. 再びJARを実行して「動画 -> 元のファイル」へ復元
+        # ※逆変換用のフラグ（例: -vtf）や引数を指定してください
+        java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -vtf -fp test_workspace/out
+        
+        echo "=== RESTORED FILE GENERATED ==="
+        ls -la test_workspace/dec/
+
+    - name: Strict Integrity Verification (SHA-256 Check)
+      run: |
+        # 4. 復元されたファイルのハッシュ値を計算
+        echo "=== RESTORED FILE SHA-256 ==="
+        shasum -a 256 test_workspace/dec/integrity_test_source.dat | tee test_workspace/restored_hash.txt
+        
+        echo "--------------------------------------------------"
+        echo "Comparing Source Hash and Restored Hash..."
+        echo "--------------------------------------------------"
+        
+        # diffコマンドで2つのハッシュ値テキストを厳密に比較。1文字でも違えば終了コード1で落ちます
+        if diff test_workspace/source_hash.txt test_workspace/restored_hash.txt > /dev/null; then
+          echo "✅ INTEGRITY PASSED: Files are 100% identical at bit-level!"
+          exit 0
+        else
+          echo "❌ INTEGRITY FAILED: Bit mismatch detected between source and restored file!"
+          
+          # デバッグ用にxxd（Hexエディタ風表示）の差分をログに出力
+          echo "=== First 256 bytes diff ==="
+          xxd -l 256 test_workspace/in/integrity_test_source.dat > test_workspace/src.hex
+          xxd -l 256 test_workspace/dec/integrity_test_source.dat > test_workspace/dec.hex
+          diff -u test_workspace/src.hex test_workspace/dec.hex || true
+          
+          exit 1
+        fi
