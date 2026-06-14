@@ -9,6 +9,8 @@ jobs:
   build:
     name: Build JAR (Mac ARM64)
     runs-on: macos-latest
+    env:
+      AV_LOG_FORCE_NOCOLOR: 1
     
     steps:
     - name: Checkout repository
@@ -35,6 +37,8 @@ jobs:
         shasum -a 256 test_workspace/in/integrity_test_source.dat | tee test_workspace/source_hash.txt
 
     - name: Execute Files-To-Videos Conversion (Encode)
+      env:
+        FFMPEG_ALLOW_SW: "1"
       run: |
         java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -ftv -fp test_workspace/in -t 1
         echo "=== ENCODE COMPLETED ==="
@@ -42,7 +46,7 @@ jobs:
         echo "VIDEO_DIR=$VIDEO_DIR" >> $GITHUB_ENV
         echo "=== CHECK GENERATED VIDEO DETAILS ==="
         ls -la "$VIDEO_DIR"
-
+        
     - name: Execute Videos-To-Files Conversion (Decode)
       run: |
         echo "=== STARTING DECODE ==="
