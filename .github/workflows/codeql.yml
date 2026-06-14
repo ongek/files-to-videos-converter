@@ -3,7 +3,7 @@ name: "Native Mac ARM64 Lightweight Build"
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: # 手動実行もできるようにトリガーを追加
+  workflow_dispatch:
 
 jobs:
   build:
@@ -25,53 +25,39 @@ jobs:
       run: mvn clean package -DskipTests
 
     # =================================================================
-    # 【追加】往復エンコード・デコード整合性確認フェーズ (30MB仕様)
+    # 往復エンコード・デコード整合性確認フェーズ (30MB & デバッグログ強化)
     # =================================================================
     - name: Prepare Integrity Test Workspace
       run: |
         mkdir -p test_workspace/in
-        
-        # 30MB (1024KB * 30) のランダムなバイナリテストデータを動的に生成
         dd if=/dev/urandom of=test_workspace/in/integrity_test_source.dat bs=1024 count=30720
-        
         echo "=== SOURCE FILE SHA-256 ==="
         shasum -a 256 test_workspace/in/integrity_test_source.dat | tee test_workspace/source_hash.txt
 
     - name: Execute Files-To-Videos Conversion (Encode)
       run: |
-        # エンコード実行（標準出力・標準エラーをすべて可視化）
         java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -ftv -fp test_workspace/in -t 1
-        
         echo "=== ENCODE COMPLETED ==="
         VIDEO_DIR=$(ls -d resultVideos* | head -n 1)
         echo "VIDEO_DIR=$VIDEO_DIR" >> $GITHUB_ENV
-        
         echo "=== CHECK GENERATED VIDEO DETAILS ==="
-        # フォルダの中身と、生成された動画ファイルのサイズを厳密にチェック
         ls -la "$VIDEO_DIR"
 
     - name: Execute Videos-To-Files Conversion (Decode)
       run: |
         echo "=== STARTING DECODE ==="
         echo "Target Video Directory: ${{ env.VIDEO_DIR }}"
-        
-        # デコードを実行。内部のエラーログが握りつぶされないよう、詳細なログ出力を期待
         java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -vtf -vp "${{ env.VIDEO_DIR }}" -t 1
-        
         echo "=== DECODE PROCESS FINISHED ==="
         echo "=== FULL DIRECTORY TREE RE-CHECK ==="
-        # どこに何が作られたか（あるいは作られなかったか）をすべて出力
         ls -la
-        
         RESTORED_PATH=$(find resultFiles* -name "integrity_test_source.dat" 2>/dev/null | head -n 1)
-        
         if [ -z "$RESTORED_PATH" ]; then
           echo "❌ ERROR: Restored file was not found."
           echo "Let's check if any resultFiles directory exists at all:"
           ls -ld resultFiles* || echo "No resultFiles directory found."
           exit 1
         fi
-        
         echo "Found Real Restored File At: $RESTORED_PATH"
         echo "RESTORED_FILE_PATH=$RESTORED_PATH" >> $GITHUB_ENV
 
@@ -79,18 +65,14 @@ jobs:
       run: |
         echo "=== RESTORED FILE SHA-256 ==="
         shasum -a 256 "${{ env.RESTORED_FILE_PATH }}" | awk '{print $1 "  test_workspace/in/integrity_test_source.dat"}' > test_workspace/restored_hash.txt
-        
         echo "--------------------------------------------------"
         echo "Comparing Source Hash and Restored Hash..."
         echo "--------------------------------------------------"
-        
-        # diffが不一致なら終了コード1でCIをここで落とす（以降のステップは実行されません）
         if diff test_workspace/source_hash.txt test_workspace/restored_hash.txt > /dev/null; then
           echo "✅ INTEGRITY PASSED: Files are 100% identical at bit-level!"
           exit 0
         else
           echo "❌ INTEGRITY FAILED: Bit mismatch detected between source and restored file!"
-          
           echo "=== Hex diff of first 256 bytes ==="
           xxd -l 256 test_workspace/in/integrity_test_source.dat > test_workspace/src.hex
           xxd -l 256 "${{ env.RESTORED_FILE_PATH }}" > test_workspace/dec.hex
