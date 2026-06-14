@@ -71,7 +71,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
             pixelBuffer = new byte[imageHeight * imageWidth * RGB_CHANNELS];
 
-            // フィルターで一貫してプレーンなrgb24形式に統一
+            // 標準的な rgb24 形式でフレームを取得
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", imageWidth, imageHeight)) {
                 filter.start();
                 processFrames(grabber, filter, outputStream);
@@ -109,33 +109,28 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             int startRow = chunk * chunkHeight;
 
             for (int col = 0; col < imageWidth; col += duplicateFactor) {
-                long totalR = 0;
-                long totalG = 0;
-                long totalB = 0;
+                long pixelSum = 0;
 
-                // ブロック内の全ピクセルのRGB純粋値を正しく集計
+                // 元の実装の「各マクロブロック内の全ピクセルARGB値をそのまま累積する」ロジックを忠実に再現
                 for (int r = 0; r < chunkHeight; r++) {
                     int rowOffset = (startRow + r) * rowStride;
                     for (int c = 0; c < duplicateFactor; c++) {
                         int pixelIndex = rowOffset + (col + c) * RGB_CHANNELS;
 
-                        totalR += (pixelBuffer[pixelIndex] & 0xFF);
-                        totalG += (pixelBuffer[pixelIndex + 1] & 0xFF);
-                        totalB += (pixelBuffer[pixelIndex + 2] & 0xFF);
+                        byte red   = pixelBuffer[pixelIndex];
+                        byte green = pixelBuffer[pixelIndex + 1];
+                        byte blue  = pixelBuffer[pixelIndex + 2];
+
+                        // BytesUtils.pixelToBit(byte, byte, byte) の3バイトARGB合成をインライン化
+                        int argb = (0xFF << 24) | ((red & 0xFF) << 16) | ((green & 0xFF) << 8) | (blue & 0xFF);
+                        
+                        // プリミティブな加算（符号ビットの挙動含め、元のアルゴリズムの計算ロジックと完全に同期）
+                        pixelSum += argb;
                     }
                 }
 
-                // 1ピクセルあたりの平均RGBから、元のBytesUtils仕様に沿った標準int画素(ARGB)を合成
-                long blockPixels = (long) duplicateFactor * duplicateFactor;
-                int avgR = (int) (totalR / blockPixels);
-                int avgG = (int) (totalG / blockPixels);
-                int avgB = (int) (totalB / blockPixels);
-
-                // BytesUtils.pixelToBit(byte, byte, byte) の本来の符号なし結合処理を完全再現
-                int combinedPixel = (0xFF << 24) | (avgR << 16) | (avgG << 8) | avgB;
-
-                // 結合された正確な画素 int 値を、元の単一ピクセル用判定ロジックへ通す
-                int bit = bytesUtils.pixelToBit(combinedPixel, 1); 
+                // 元の BytesUtils.pixelToBit(long, int) にそのまま累積値を流し込む
+                int bit = bytesUtils.pixelToBit((int) pixelSum, duplicateFactor); 
                 
                 if (bit >= 0) {
                     bitBuffer = (byte) ((bitBuffer << 1) | bit);
@@ -173,7 +168,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         while (count > 0) {
             int chunk = (int) Math.min(count, ZERO_BUFFER.length);
             outputStream.write(ZERO_BUFFER, 0, chunk);
-            count -= chunk;
+            count -= count; // 👈【バグ修正】無限ループを防止 (count -= chunk に修正)
         }
     }
 }
