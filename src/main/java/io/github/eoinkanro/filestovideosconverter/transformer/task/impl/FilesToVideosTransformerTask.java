@@ -1,4 +1,3 @@
-現状、まだパフォーマンスの改善とバグ修正の余地ある？
 package io.github.eoinkanro.filestovideosconverter.transformer.task.impl;
 
 import io.github.eoinkanro.filestovideosconverter.transformer.TransformException;
