@@ -218,7 +218,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
      */
     private void processLastPixels(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
         if (tempRowIndex < tempRow.length) {
-            for (int i = TeamRowIndex; i < tempRow.length; i++) {
+            for (int i = tempRowIndex; i < tempRow.length; i++) {
                 tempRow[i] = ZERO;
             }
             writeTempRowIntoImage();
