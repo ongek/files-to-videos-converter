@@ -121,7 +121,7 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
         videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
         
         videoRecorder.setVideoCodecName("hevc_videotoolbox"); 
-        videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
+        videoRecorder.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P);
 
         videoRecorder.setVideoOption("f", "rawvideo");
         videoRecorder.setVideoOption("realtime", "1");
@@ -134,29 +134,30 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
         videoRecorder.setOption("movflags", "faststart");
 
         // -----------------------------------------------------------------
-        // 【完全勝利版】start()の前にAVFormatContextを先制生成してhvc1を仕込む
+        // 【完全勝利版・型安全コンパイル対応】
+        // start()の前にAVFormatContextを先制生成してhvc1を仕込む
         // -----------------------------------------------------------------
         try {
             // 1. レコーダーの内部フィールド "oc" をリフレクションで取得
             java.lang.reflect.Field ocField = FFmpegFrameRecorder.class.getDeclaredField("oc");
             ocField.setAccessible(true);
 
-            // 2. まだ start() 前なので oc は null。ここに先回りして構造体を割り当てる
+            // 2. 先回りして出力文脈（AVFormatContext）をインスタンス化
             org.bytedeco.ffmpeg.avformat.AVFormatContext oc = new org.bytedeco.ffmpeg.avformat.AVFormatContext();
             
-            // 出力フォーマット（mp4）の文脈を生成してocにセット
-            org.bytedeco.ffmpeg.avformat.AVOutputFormat oformat = org.bytedeco.ffmpeg.avformat.av_guess_format("mp4", null, null);
-            org.bytedeco.ffmpeg.avformat.avformat_alloc_output_context2(oc, oformat, null, null);
+            // 3. 出力フォーマット（mp4）の判定とコンテキストへの割り当て（globalクラスのネイティブメソッドを使用）
+            org.bytedeco.ffmpeg.avformat.AVOutputFormat oformat = org.bytedeco.ffmpeg.global.avformat.av_guess_format("mp4", null, null);
+            org.bytedeco.ffmpeg.global.avformat.avformat_alloc_output_context2(oc, oformat, null, null);
             
-            // 3. レコーダーインスタンスに、私たちが作った生の oc を上書きインジェクション
+            // 4. レコーダーインスタンスに、先制生成した oc をインジェクション
             ocField.set(videoRecorder, oc);
 
-            // 4. 新しく作ったコンテキスト内に、あらかじめビデオストリーム（0番目）を1本生やしておく
-            org.bytedeco.ffmpeg.avcodec.AVCodec codec = org.bytedeco.ffmpeg.avcodec.avcodec_find_encoder_by_name("hevc_videotoolbox");
-            org.bytedeco.ffmpeg.avformat.AVStream videoStream = org.bytedeco.ffmpeg.avformat.avformat_new_stream(oc, codec);
+            // 5. ビデオストリーム（0番目）を1本生やし、エンコーダ（hevc_videotoolbox）を割り当てる
+            org.bytedeco.ffmpeg.avcodec.AVCodec codec = org.bytedeco.ffmpeg.global.avcodec.avcodec_find_encoder_by_name("hevc_videotoolbox");
+            org.bytedeco.ffmpeg.avformat.AVStream videoStream = org.bytedeco.ffmpeg.global.avformat.avformat_new_stream(oc, codec);
             
             if (videoStream != null && videoStream.codecpar() != null) {
-                // ここでヘッダー書き込みの「前」に 'hvc1' (0x31637668) を絶対強制注入
+                // ヘッダーが物理的にファイルへ書き込まれる前に 'hvc1' (0x31637668) を絶対強制注入
                 int hvc1Tag = 0x31637668;
                 videoStream.codecpar().codec_tag(hvc1Tag);
                 log.info("Pre-injected 'hvc1' tag into pre-allocated AVFormatContext successfully.");
@@ -166,8 +167,8 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
             log.warn("Failed to pre-inject hvc1 tag. Continuing with standard start.", e);
         }
 
-        // 5. 準備完了した状態でスタートさせる
-        // JavaCVはすでに "oc" が存在する場合、それを流用してヘッダー書き込みに進みます
+        // 6. 準備完了した状態でスタート
+        // 既に "oc" がインジェクションされているため、JavaCVはこれを流用してヘッダー書き込みを行います
         videoRecorder.start();
     }
 
