@@ -37,8 +37,11 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         log.info("Processing {}...", processData);
         init(processData);
 
+        // あとで呼び出すために、生成される動画ファイルの参照をtryの外側に定義しておきます
+        File resultVideoFile = fileUtils.getFilesToVideosResultFile(processData, lastZeroBytesCount);
+
         try (BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData));
-             FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(fileUtils.getFilesToVideosResultFile(processData, lastZeroBytesCount),
+             FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(resultVideoFile,
                                                                          inputCLIArgumentsHolder.getArgument(IMAGE_WIDTH),
                                                                          inputCLIArgumentsHolder.getArgument(IMAGE_HEIGHT))) {
 
@@ -66,10 +69,17 @@ public class FilesToVideosTransformerTask extends TransformerTask {
             }
 
             processLastPixels(videoRecorder);
+            // ─── ここで try (FFmpegFrameRecorder) が閉じ、動画ファイルが物理的に保存されます ───
         } catch (Exception e) {
             log.error(COMMON_EXCEPTION_DESCRIPTION, e);
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
+
+        // =================================================================
+        // 【ここに挿入】動画が正常に書き閉じられた直後に、FourCCをバイナリレベルで偽装
+        // =================================================================
+        convertHev1ToHvc1(resultVideoFile);
+        // =================================================================
 
         taskStatistics.logResult();
         log.info("File {} was processed successfully", processData);
@@ -105,18 +115,12 @@ public class FilesToVideosTransformerTask extends TransformerTask {
     }
 
     /**
-     * Init ffmpeg recorder that creates result video
-     *
-     * @param videoRecorder - ffmpeg recorder
-     * @throws FFmpegFrameRecorder.Exception - if recorder can't be started
-     */
-/**
      * Init ffmpeg recorder that creates result video with VideoToolbox H265 (hvc1 compatible)
      *
      * @param videoRecorder - ffmpeg recorder
      * @throws FFmpegFrameRecorder.Exception - if recorder can't be started
      */
-private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
+    private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
         videoRecorder.setFormat("mp4");
         videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
         
@@ -125,52 +129,47 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
 
         videoRecorder.setVideoOption("f", "rawvideo");
         videoRecorder.setVideoOption("realtime", "1");
-        videoRecorder.setVideoBitrate(8000000); // 8Mbps
+        videoRecorder.setVideoBitrate(8000000);
 
         videoRecorder.setAudioChannels(0);
         videoRecorder.setSampleRate(0);
 
-        // Apple互換性を高める高速起動フラグ
         videoRecorder.setOption("movflags", "faststart");
 
-        // -----------------------------------------------------------------
-        // 【完全型確定版】
-        // start()の前にAVFormatContextを先制生成してhvc1を仕込む
-        // -----------------------------------------------------------------
-        try {
-            // 1. レコーダーの内部フィールド "oc" をリフレクションで取得
-            java.lang.reflect.Field ocField = FFmpegFrameRecorder.class.getDeclaredField("oc");
-            ocField.setAccessible(true);
-
-            // 2. 先回りして出力文脈（AVFormatContext）をインスタンス化
-            org.bytedeco.ffmpeg.avformat.AVFormatContext oc = new org.bytedeco.ffmpeg.avformat.AVFormatContext();
-            
-            // 3. 出力フォーマット（mp4）の判定
-            org.bytedeco.ffmpeg.avformat.AVOutputFormat oformat = org.bytedeco.ffmpeg.global.avformat.av_guess_format("mp4", null, null);
-            
-            // 【修正箇所】null を (String) にキャストしてコンパイラの迷子を防止
-            org.bytedeco.ffmpeg.global.avformat.avformat_alloc_output_context2(oc, oformat, (String) null, (String) null);
-            
-            // 4. レコーダーインスタンスに、先制生成した oc をインジェクション
-            ocField.set(videoRecorder, oc);
-
-            // 5. ビデオストリーム（0番目）を1本生やし、エンコーダ（hevc_videotoolbox）を割り当てる
-            org.bytedeco.ffmpeg.avcodec.AVCodec codec = org.bytedeco.ffmpeg.global.avcodec.avcodec_find_encoder_by_name("hevc_videotoolbox");
-            org.bytedeco.ffmpeg.avformat.AVStream videoStream = org.bytedeco.ffmpeg.global.avformat.avformat_new_stream(oc, codec);
-            
-            if (videoStream != null && videoStream.codecpar() != null) {
-                // ヘッダーが物理的にファイルへ書き込まれる前に 'hvc1' (0x31637668) を絶対強制注入
-                int hvc1Tag = 0x31637668;
-                videoStream.codecpar().codec_tag(hvc1Tag);
-                log.info("Pre-injected 'hvc1' tag into pre-allocated AVFormatContext successfully.");
-            }
-
-        } catch (Exception e) {
-            log.warn("Failed to pre-inject hvc1 tag. Continuing with standard start.", e);
-        }
-
-        // 6. 準備完了した状態でスタート
         videoRecorder.start();
+    }
+
+    /**
+     * 【新規追加メソッド】生成されたMP4を直接バイナリハックするロジック
+     * @param mp4File 生成された動画ファイル
+     */
+    private void convertHev1ToHvc1(File mp4File) {
+        if (mp4File == null || !mp4File.exists()) return;
+
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(mp4File, "rw")) {
+            long length = raf.length();
+            byte[] buffer = new byte[4];
+            
+            // MP4のメタデータが含まれる先頭4KBのセクターだけを高速スキャン
+            long maxSearchBytes = Math.min(length - 4, 4096); 
+            
+            for (long i = 0; i < maxSearchBytes; i++) {
+                raf.seek(i);
+                raf.readFully(buffer);
+                
+                // 「hev1」（0x68, 0x65, 0x76, 0x31）を発見した場合
+                if (buffer[0] == 0x68 && buffer[1] == 0x65 && buffer[2] == 0x76 && buffer[3] == 0x31) {
+                    // Apple互換の「hvc1」（0x68, 0x76, 0x63, 0x31）に直接ピンポイント上書き
+                    raf.seek(i);
+                    raf.write(new byte[]{0x68, 0x76, 0x63, 0x31});
+                    
+                    log.info("Successfully patched MP4 container FourCC from 'hev1' to 'hvc1' for: {}", mp4File.getName());
+                    break; // 置換が完了したら即座にループを抜けて終了
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to patch MP4 FourCC metadata directly.", e);
+        }
     }
 
     /**
@@ -219,7 +218,7 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
      */
     private void processLastPixels(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
         if (tempRowIndex < tempRow.length) {
-            for (int i = tempRowIndex; i < tempRow.length; i++) {
+            for (int i = TeamRowIndex; i < tempRow.length; i++) {
                 tempRow[i] = ZERO;
             }
             writeTempRowIntoImage();
