@@ -1,75 +1,28 @@
-name: Verify Converter Integrity
-
-on:
-  push:
-    branches: [ main, master, develop ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:
-
-jobs:
-  build-and-verify:
-    runs-on: macos-latest
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Set up JDK 26
-      uses: actions/setup-java@v4
-      with:
-        java-version: '26'
-        distribution: 'oracle'
-        cache: 'maven'
-
-    - name: Build with Maven
-      run: mvn clean package -DskipTests
-
-    - name: Prepare Test Workspace
-      run: |
-        mkdir -p test_workspace/in
-        
-        # 【改善】テストデータを30MB (1024KB * 30) に大幅増量してパイプラインを安定化
-        dd if=/dev/urandom of=test_workspace/in/integrity_test_source.dat bs=1024 count=30720
-        
-        echo "=== SOURCE FILE SHA-256 ==="
-        shasum -a 256 test_workspace/in/integrity_test_source.dat | tee test_workspace/source_hash.txt
-
-    - name: Execute Files-To-Videos Conversion (Encode)
-      run: |
-        # ファイル -> 動画変換 (並行処理のバグ防止のため一旦シングルスレッドで厳密にテスト)
-        java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -ftv -fp test_workspace/in -t 1
-        
-        echo "=== ENCODE COMPLETED ==="
-        # 生成された動画ディレクトリを確実に捕捉
-        VIDEO_DIR=$(ls -d resultVideos* | head -n 1)
-        echo "VIDEO_DIR=$VIDEO_DIR" >> $GITHUB_ENV
-        echo "Generated Video Directory: $VIDEO_DIR"
-        ls -la "$VIDEO_DIR"
-
-    - name: Execute Videos-To-Files Conversion (Decode)
+- name: Execute Videos-To-Files Conversion (Decode)
       run: |
         # 動画 -> ファイル逆変換
         java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -vtf -vp "${{ env.VIDEO_DIR }}" -t 1
         
         echo "=== DECODE COMPLETED ==="
-        # もしカレントディレクトリにresultFilesが出ない場合に備え、
-        # ディレクトリ全体から「integrity_test_source.dat」を持つ復元先フォルダを強制捜索
-        RESTORED_PATH=$(find . -name "integrity_test_source.dat" | grep -v "test_workspace/in" | head -n 1)
+        ls -la
+        
+        # 【修正】検索範囲を「resultFiles*」の中だけに限定！
+        # これにより、test_workspace/in の元ファイルに誤ってヒットするのを100%防ぎます。
+        RESTORED_PATH=$(find resultFiles* -name "integrity_test_source.dat" 2>/dev/null | head -n 1)
         
         if [ -z "$RESTORED_PATH" ]; then
-          echo "❌ ERROR: Restored file 'integrity_test_source.dat' was not found anywhere!"
+          echo "❌ ERROR: Restored file 'integrity_test_source.dat' was not found in resultFiles*!"
           echo "=== Directory State ==="
           ls -R
           exit 1
         fi
         
-        echo "Found Restored File At: $RESTORED_PATH"
+        echo "Found Real Restored File At: $RESTORED_PATH"
         echo "RESTORED_FILE_PATH=$RESTORED_PATH" >> $GITHUB_ENV
 
     - name: Strict Integrity Verification (SHA-256 Check)
       run: |
-        # 復元されたファイルのハッシュ計算
+        # 復元された本物のファイルのハッシュ計算
         echo "=== RESTORED FILE SHA-256 ==="
         shasum -a 256 "${{ env.RESTORED_FILE_PATH }}" | awk '{print $1 "  test_workspace/in/integrity_test_source.dat"}' > test_workspace/restored_hash.txt
         
