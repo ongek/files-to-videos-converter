@@ -29,22 +29,19 @@ jobs:
       run: |
         mkdir -p test_workspace/in
         
-        # 1. テスト用のランダムデータ（1MB）を生成
-        dd if=/dev/urandom of=test_workspace/in/integrity_test_source.dat bs=1024 count=1024
+        # 【改善】テストデータを30MB (1024KB * 30) に大幅増量してパイプラインを安定化
+        dd if=/dev/urandom of=test_workspace/in/integrity_test_source.dat bs=1024 count=30720
         
         echo "=== SOURCE FILE SHA-256 ==="
         shasum -a 256 test_workspace/in/integrity_test_source.dat | tee test_workspace/source_hash.txt
 
     - name: Execute Files-To-Videos Conversion (Encode)
       run: |
-        # 2. ファイル -> 動画変換
-        # 出力先を固定するため、一時的に引数で指定した場所に書き出されるか、
-        # またはデフォルト生成されるフォルダを後から特定します。
+        # ファイル -> 動画変換 (並行処理のバグ防止のため一旦シングルスレッドで厳密にテスト)
         java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -ftv -fp test_workspace/in -t 1
         
         echo "=== ENCODE COMPLETED ==="
-        ls -la
-        # 生成された「resultVideos〜」というフォルダ名を一意に特定して環境変数に保存
+        # 生成された動画ディレクトリを確実に捕捉
         VIDEO_DIR=$(ls -d resultVideos* | head -n 1)
         echo "VIDEO_DIR=$VIDEO_DIR" >> $GITHUB_ENV
         echo "Generated Video Directory: $VIDEO_DIR"
@@ -52,25 +49,29 @@ jobs:
 
     - name: Execute Videos-To-Files Conversion (Decode)
       run: |
-        # 3. 動画 -> ファイル逆変換
-        # 【修正】動画からのデコード時は「-vtf」と「-vp <動画パス>」を使用します
+        # 動画 -> ファイル逆変換
         java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -vtf -vp "${{ env.VIDEO_DIR }}" -t 1
         
         echo "=== DECODE COMPLETED ==="
-        ls -la
-        # 生成された「resultFiles〜」というフォルダ名を一意に特定して環境変数に保存
-        FILE_DIR=$(ls -d resultFiles* | head -n 1)
-        echo "FILE_DIR=$FILE_DIR" >> $GITHUB_ENV
-        echo "Generated Restored File Directory: $FILE_DIR"
-        ls -la "$FILE_DIR"
+        # もしカレントディレクトリにresultFilesが出ない場合に備え、
+        # ディレクトリ全体から「integrity_test_source.dat」を持つ復元先フォルダを強制捜索
+        RESTORED_PATH=$(find . -name "integrity_test_source.dat" | grep -v "test_workspace/in" | head -n 1)
+        
+        if [ -z "$RESTORED_PATH" ]; then
+          echo "❌ ERROR: Restored file 'integrity_test_source.dat' was not found anywhere!"
+          echo "=== Directory State ==="
+          ls -R
+          exit 1
+        fi
+        
+        echo "Found Restored File At: $RESTORED_PATH"
+        echo "RESTORED_FILE_PATH=$RESTORED_PATH" >> $GITHUB_ENV
 
     - name: Strict Integrity Verification (SHA-256 Check)
       run: |
-        # 4. 復元されたファイルのパスを特定してハッシュ計算
-        RESTORED_FILE="${{ env.FILE_DIR }}/integrity_test_source.dat"
-        
+        # 復元されたファイルのハッシュ計算
         echo "=== RESTORED FILE SHA-256 ==="
-        shasum -a 256 "$RESTORED_FILE" | awk '{print $1 "  test_workspace/in/integrity_test_source.dat"}' > test_workspace/restored_hash.txt
+        shasum -a 256 "${{ env.RESTORED_FILE_PATH }}" | awk '{print $1 "  test_workspace/in/integrity_test_source.dat"}' > test_workspace/restored_hash.txt
         
         echo "--------------------------------------------------"
         echo "Comparing Source Hash and Restored Hash..."
@@ -84,7 +85,7 @@ jobs:
           
           echo "=== Hex diff of first 256 bytes ==="
           xxd -l 256 test_workspace/in/integrity_test_source.dat > test_workspace/src.hex
-          xxd -l 256 "$RESTORED_FILE" > test_workspace/dec.hex
+          xxd -l 256 "${{ env.RESTORED_FILE_PATH }}" > test_workspace/dec.hex
           diff -u test_workspace/src.hex test_workspace/dec.hex || true
           exit 1
         fi
