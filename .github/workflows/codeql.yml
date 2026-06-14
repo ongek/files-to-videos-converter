@@ -37,7 +37,7 @@ jobs:
         echo "=== SOURCE FILE SHA-256 ==="
         shasum -a 256 test_workspace/in/integrity_test_source.dat | tee test_workspace/source_hash.txt
 
-- name: Execute Files-To-Videos Conversion (Encode)
+    - name: Execute Files-To-Videos Conversion (Encode)
       run: |
         # エンコード実行（標準出力・標準エラーをすべて可視化）
         java -jar -Xmx2048m -Xms2048m target/FilesToVideosConverter.jar -ftv -fp test_workspace/in -t 1
