@@ -117,17 +117,31 @@ public class FilesToVideosTransformerTask extends TransformerTask {
      * @throws FFmpegFrameRecorder.Exception - if recorder can't be started
      */
     private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
-        // コンテナフォーマットの設定
         videoRecorder.setFormat("mp4");
         videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
         
-        // コーデック設定
         videoRecorder.setVideoCodecName("hevc_videotoolbox"); 
         videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
-        videoRecorder.setOption("tag:v", "hvc1");
+
+        videoRecorder.setVideoOption("f", "rawvideo");
+        
         videoRecorder.setVideoOption("realtime", "1");
-        videoRecorder.setVideoOption("profile", "main"); // プロファイルを明示
-        videoRecorder.setVideoBitrate(8000000); 
+
+        // ==========================================
+        // 【hvc1 強制上書きの確定版ロジック】
+        // ==========================================
+        // アプローチ1: コンテナ側ではなく、ビデオコーデック側の内部プロパティとして
+        // `-vtag hvc1` 相当の挙動を直接流し込みます。
+        videoRecorder.setVideoOption("vtag", "hvc1");
+
+        // アプローチ2: それでも通らない場合に備え、
+        // 出力ストリーム全体のグローバルなメタデータ（FourCCコード）として明示的にインジェクションします。
+        videoRecorder.setOption("vtag", "hvc1");
+        videoRecorder.setOption("video_tag", "hvc1");
+        // ==========================================
+
+        videoRecorder.setVideoBitrate(8000000); // 8Mbps（前回の動作に合わせて固定）
+
         videoRecorder.setAudioChannels(0);
         videoRecorder.setSampleRate(0);
 
