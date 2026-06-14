@@ -35,50 +35,60 @@ public class FilesToVideosTransformerTask extends TransformerTask {
     @Override
     protected void process() {
         log.info("Processing {}...", processData);
+        
+        // 1. 元々あった初期化メソッドを元の位置で実行（これで例外の隠蔽関係を元に戻す）
         init(processData);
 
-        // あとで呼び出すために、生成される動画ファイルの参照をtryの外側に定義しておきます
-        File resultVideoFile = fileUtils.getFilesToVideosResultFile(processData, lastZeroBytesCount);
+        // 2. tryの外側で宣言だけしておき、初期値は null に（IOExceptionを避ける）
+        File resultVideoFile = null;
 
-        try (BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData));
-             FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(resultVideoFile,
-                                                                         inputCLIArgumentsHolder.getArgument(IMAGE_WIDTH),
-                                                                         inputCLIArgumentsHolder.getArgument(IMAGE_HEIGHT))) {
+        try {
+            // tryブロックの中で安全にパスを取得
+            resultVideoFile = fileUtils.getFilesToVideosResultFile(processData, lastZeroBytesCount);
+            
+            // 実際のストリームとレコーダーのオープン処理
+            try (BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData));
+                 FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(resultVideoFile,
+                                                                             inputCLIArgumentsHolder.getArgument(IMAGE_WIDTH),
+                                                                             inputCLIArgumentsHolder.getArgument(IMAGE_HEIGHT))) {
 
-            initVideoRecorder(videoRecorder);
-            int aByte;
+                initVideoRecorder(videoRecorder);
+                int aByte;
 
-            while ((aByte = inputStream.read()) >= 0) {
-                String bits = bytesUtils.byteToBits(aByte);
+                while ((aByte = inputStream.read()) >= 0) {
+                    String bits = bytesUtils.byteToBits(aByte);
 
-                for (int i = 0; i < bits.length(); i++) {
-                    if (tempRowIndex >= tempRow.length) {
-                        writeTempRowIntoImage();
-                        initTempRow();
+                    for (int i = 0; i < bits.length(); i++) {
+                        if (tempRowIndex >= tempRow.length) {
+                            writeTempRowIntoImage();
+                            initTempRow();
+                        }
+
+                        if (pixelIndex >= pixels.length) {
+                            writeImageIntoVideo(videoRecorder);
+                            initPixels();
+                        }
+
+                        int pixel = bytesUtils.bitToPixel(Character.getNumericValue(bits.charAt(i)));
+                        tempRow[tempRowIndex] = pixel;
+                        tempRowIndex++;
                     }
-
-                    if (pixelIndex >= pixels.length) {
-                        writeImageIntoVideo(videoRecorder);
-                        initPixels();
-                    }
-
-                    int pixel = bytesUtils.bitToPixel(Character.getNumericValue(bits.charAt(i)));
-                    tempRow[tempRowIndex] = pixel;
-                    tempRowIndex++;
                 }
-            }
 
-            processLastPixels(videoRecorder);
-            // ─── ここで try (FFmpegFrameRecorder) が閉じ、動画ファイルが物理的に保存されます ───
+                processLastPixels(videoRecorder);
+                // ─── ここで動画ファイルが完全に書き閉じられます ───
+            }
         } catch (Exception e) {
             log.error(COMMON_EXCEPTION_DESCRIPTION, e);
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
         // =================================================================
-        // 【ここに挿入】動画が正常に書き閉じられた直後に、FourCCをバイナリレベルで偽装
+        // 【安全地帯】動画クローズ完了後、かつ例外に引っかからなかった場合のみ FourCC を偽装
         // =================================================================
-        convertHev1ToHvc1(resultVideoFile);
+        if (resultVideoFile != null) {
+            convertHev1ToHvc1(resultVideoFile);
+        }
         // =================================================================
 
         taskStatistics.logResult();
