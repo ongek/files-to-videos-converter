@@ -134,7 +134,7 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
         videoRecorder.setOption("movflags", "faststart");
 
         // -----------------------------------------------------------------
-        // 【完全勝利版・型安全コンパイル対応】
+        // 【完全型確定版】
         // start()の前にAVFormatContextを先制生成してhvc1を仕込む
         // -----------------------------------------------------------------
         try {
@@ -145,9 +145,11 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
             // 2. 先回りして出力文脈（AVFormatContext）をインスタンス化
             org.bytedeco.ffmpeg.avformat.AVFormatContext oc = new org.bytedeco.ffmpeg.avformat.AVFormatContext();
             
-            // 3. 出力フォーマット（mp4）の判定とコンテキストへの割り当て（globalクラスのネイティブメソッドを使用）
+            // 3. 出力フォーマット（mp4）の判定
             org.bytedeco.ffmpeg.avformat.AVOutputFormat oformat = org.bytedeco.ffmpeg.global.avformat.av_guess_format("mp4", null, null);
-            org.bytedeco.ffmpeg.global.avformat.avformat_alloc_output_context2(oc, oformat, null, null);
+            
+            // 【修正箇所】null を (String) にキャストしてコンパイラの迷子を防止
+            org.bytedeco.ffmpeg.global.avformat.avformat_alloc_output_context2(oc, oformat, (String) null, (String) null);
             
             // 4. レコーダーインスタンスに、先制生成した oc をインジェクション
             ocField.set(videoRecorder, oc);
@@ -168,7 +170,6 @@ private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegF
         }
 
         // 6. 準備完了した状態でスタート
-        // 既に "oc" がインジェクションされているため、JavaCVはこれを流用してヘッダー書き込みを行います
         videoRecorder.start();
     }
 
