@@ -2,57 +2,45 @@ package io.github.eoinkanro.filestovideosconverter.utils;
 
 import org.springframework.stereotype.Component;
 
-import java.awt.*;
-
 @Component
 public class BytesUtils {
 
-    public static final int ONE = Color.BLACK.getRGB();
-    public static final int ONE_MIN = ONE / 2 - 1;
-    public static final int ZERO = Color.white.getRGB();
+    // 1ピクセル（R+G+B）が「白」か「黒」かを分ける輝度閾値
+    private static final int BRIGHTNESS_THRESHOLD = 382;
 
     /**
-     * Transform byte to bits string
-     * example: 00000001
-     *
-     * @param aByte - byte
-     * @return - bits string
+     * 3つの色成分から輝度の和を求めます。
+     * Java 26のJITコンパイラが最もインライン化しやすいよう、
+     * Byte.toUnsignedInt() を使用（内部的に & 0xFF と同等だがセマンティクスが明確）。
      */
-    public String byteToBits(int aByte) {
-        String bits = Integer.toBinaryString(aByte);
-        int additionalZeros = 8 - bits.length();
-        return "0".repeat(additionalZeros) +
-                bits;
+    public static int getPixelBrightness(byte c1, byte c2, byte c3) {
+        return Byte.toUnsignedInt(c1) + Byte.toUnsignedInt(c2) + Byte.toUnsignedInt(c3);
     }
 
     /**
-     * Transform bit pixel
-     *
-     * @param bit - bit
-     * @return - pixel
+     * ブロック全体の輝度合計から、最終的な1ビット（0か1）を判定します。
      */
-    public int bitToPixel(int bit) {
-        if (bit == 1) {
-            return ONE;
-        }
-        return ZERO;
+    public static int pixelToBit(long totalBrightnessSum, int duplicateFactor) {
+        // 重複度による総ピクセル数（int同士の乗算を一度だけ行う）
+        long totalPixelsInBlock = (long) duplicateFactor * duplicateFactor;
+        long threshold = totalPixelsInBlock * BRIGHTNESS_THRESHOLD;
+        
+        // 元のロジックを維持：閾値を超えたら0（白）、以下なら1（黒）
+        return totalBrightnessSum > threshold ? 0 : 1;
     }
 
     /**
-     * Transform pixel to bit
-     *
-     * @param pixel - pixel
-     * @param duplicateFactor - duplicate factor of pixels per bit.
-     *                          example: 2, it means that one bit is a square of pixels with size 2 x 2
-     * @return - bit
+     * 高速なビット展開（Stringの生成を完全に排除するためのプリミティブ版も用意）
+     * ※このメソッド自体は他の場所用として残しますが、デコーダー内では使いません。
      */
-    public int pixelToBit(int pixel, int duplicateFactor) {
-        long duplicateFactorPixels = (long) duplicateFactor * duplicateFactor;
-        long oneMin = duplicateFactorPixels * ONE_MIN;
-        return pixel > oneMin ? 0 : 1;
+    public static String byteToBits(int aByte) {
+        String bits = Integer.toBinaryString(aByte & 0xFF);
+        int len = bits.length();
+        if (len >= 8) return bits;
+        return "0".repeat(8 - len) + bits;
     }
 
-    public int pixelToBit(byte red, byte green, byte blue) {
-        return (0xFF << 24) | ((red & 0xFF) << 16) | ((green & 0xFF) << 8) | (blue & 0xFF);
+    public static int bitToPixel(int bit) {
+        return bit == 1 ? 0xFF000000 : 0xFFFFFFFF;
     }
 }
