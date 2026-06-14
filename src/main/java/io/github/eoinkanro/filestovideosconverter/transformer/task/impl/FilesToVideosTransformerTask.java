@@ -110,15 +110,20 @@ public class FilesToVideosTransformerTask extends TransformerTask {
      * @param videoRecorder - ffmpeg recorder
      * @throws FFmpegFrameRecorder.Exception - if recorder can't be started
      */
-    private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
+private void initVideoRecorder(FFmpegFrameRecorder videoRecorder) throws FFmpegFrameRecorder.Exception {
         videoRecorder.setFormat("mp4");
         videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
-        videoRecorder.setVideoCodecName("libx264");
+        
+        videoRecorder.setVideoCodecName("hevc_videotoolbox"); 
         videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
 
         videoRecorder.setVideoOption("f", "rawvideo");
-        videoRecorder.setVideoOption("preset", "ultrafast");
-        videoRecorder.setVideoOption("crf", "18");
+        
+        // --- リアルタイム・低遅延設定 ---
+        videoRecorder.setVideoOption("realtime", "1"); // リアルタイムモードを有効化
+        // ---------------------------------
+
+        videoRecorder.setVideoOption("q", "50"); // 画質設定
 
         videoRecorder.setAudioChannels(0);
         videoRecorder.setSampleRate(0);
