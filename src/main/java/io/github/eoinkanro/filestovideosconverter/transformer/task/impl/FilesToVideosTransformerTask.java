@@ -79,15 +79,20 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 int localTempRowIndex = 0;
                 int currentPixelIndex = 0;
 
-                // 【極限スループット・変換ループ】
+                // 【修正版ストリーム変換ループ】
                 while ((aByte = inputStream.read()) >= 0) {
+                    // aByteを0xFFでマスクし、確実に32ビットの正の整数（0〜255）として固定
+                    final int cleanByte = aByte & 0xFF;
+
+                    // 元の byteToBits の挙動（最上位ビット bit7 から順に処理）を完全に再現
                     for (int shift = 7; shift >= 0; shift--) {
                         
-                        // 文字列への変換（byteToBits）を完全に消滅させ、レジスタ内でビットを判定
-                        localTempRow[localTempRowIndex++] = ((aByte >>> shift) & 1) == 1 ? pixelOne : pixelZero;
+                        // マスクをシフトさせて直接ビットを一本釣りする（符号拡張のバグが絶対起きない）
+                        int bit = (cleanByte >>> shift) & 1;
+                        localTempRow[localTempRowIndex++] = (bit == 1) ? pixelOne : pixelZero;
 
                         if (localTempRowIndex >= localTempRowLength) {
-                            // 横方向の高速展開（SIMD自動ベクトル化を促すフラット書き込み）
+                            // 横方向の高速展開
                             int cacheIdx = 0;
                             for (int i = 0; i < localTempRowLength; i++) {
                                 final int px = localTempRow[i];
@@ -96,7 +101,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                                 }
                             }
 
-                            // 縦方向の複製処理（境界チェック内包）
+                            // 縦方向の複製処理
                             for (int r = 0; r < duplicateFactor; r++) {
                                 if (currentPixelIndex + localRowCacheLength > maxPixelsCapacity) {
                                     localBuffer.position(0);
