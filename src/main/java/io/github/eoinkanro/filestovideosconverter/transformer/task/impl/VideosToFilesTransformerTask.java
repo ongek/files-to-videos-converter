@@ -62,7 +62,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             final int width = grabber.getImageWidth();
             final int height = grabber.getImageHeight();
 
-            // 再圧縮（MPEGレンジ）をフルレンジに引き戻すネイティブフィルタ
+            // MPEGレンジをフルレンジへ引き戻し、輝度プレーンのみに絞る
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("scale=in_range=auto:out_range=full,format=gray", width, height)) {
                 filter.start();
                 
@@ -70,11 +70,9 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 int currentByteVal = 0;
                 long zeroBytesCount = 0;
 
-                // オリジナルの「ブロックの縦横数」の計算を厳密にトレース
                 final int blockRows = height / duplicateFactor;
                 final int blockCols = width / duplicateFactor;
 
-                // 境界ノイズを避けるための中心座標
                 final int halfFact = duplicateFactor >> 1;
                 final int prevFact = (halfFact - 1 >= 0) ? halfFact - 1 : halfFact;
 
@@ -87,30 +85,26 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
                     if (filteredFrame == null || filteredFrame.image == null) continue;
 
-                    // C++のネイティブヒープ上のバッファをダイレクトに参照（アロケーションゼロ）
+                    // ゼロコピー・ネイティブバッファ直撃
                     final ByteBuffer nativeBuffer = (ByteBuffer) filteredFrame.image[0];
                     
-                    // 実機CRF90環境および再圧縮環境に適合する輝度境界
-                    final int dynamicThreshold = 120;
+                    // 【修正】バイアスを排除し、0-255の数学的中心（127）にリセット
+                    // これにより圧縮ノイズが上下どちらに振れても、均等に耐性を維持します
+                    final int standardThreshold = 127;
 
-                    // 外側ループを「縦ブロック」→ 内側を「横ブロック」にするオリジナル通りの二次元走査
                     for (int r = 0; r < blockRows; r++) {
-                        // サンプリング対象となるブロック中央の行インデックスを計算
                         final int targetY = r * duplicateFactor + prevFact;
                         final int rowOffset = targetY * width;
 
                         for (int c = 0; c < blockCols; c++) {
-                            // サンプリング対象となるブロック中央の列インデックスを計算
                             final int targetX = c * duplicateFactor + prevFact;
                             
-                            // ピクセル値をダイレクトロード
+                            // 輝度（0〜255）を取得
                             final int pixelVal = nativeBuffer.get(rowOffset + targetX) & 0xFF;
 
-                            // 【重要】オリジナルに準拠した正確なビット抽出
-                            // 輝度が閾値より小さければ「黒（1）」、大きければ「白（0）」
-                            final int bit = (pixelVal < dynamicThreshold) ? 1 : 0;
+                            // 127以下（暗い＝黒）ならビット1、127より大きい（明るい＝白）ならビット0
+                            final int bit = (pixelVal <= standardThreshold) ? 1 : 0;
 
-                            // StringBuilderを排除し、プリミティブなビットシフトで直接バイトを組み立て
                             currentByteVal = (currentByteVal << 1) | bit;
                             if (++currentBitsCount == 8) {
                                 zeroBytesCount = appendByteToStream(currentByteVal, zeroBytesCount, outputStream);
