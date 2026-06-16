@@ -63,7 +63,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 videoRecorder.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P);
                 videoRecorder.setVideoOption("f", "rawvideo");
                 videoRecorder.setVideoOption("realtime", "1");
-                videoRecorder.setVideoOption("q:v", "90");
+                videoRecorder.setVideoQuality(90);
                 videoRecorder.setOption("movflags", "faststart");
                 videoRecorder.start();
 
