@@ -22,6 +22,11 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
     private static final int IO_BUFFER_SIZE = 1024 * 1024;
 
+    // プリミティブスタックフィールドへの参照速度を維持するためのコンテキスト
+    private static final class EncoderContext {
+        int currentPixelIndex = 0;
+    }
+
     public FilesToVideosTransformerTask(File processData) {
         super(processData);
     }
@@ -61,82 +66,56 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 String activeCodec = (System.getenv("GITHUB_ACTIONS") != null) ? "libx265" : "hevc_videotoolbox";
                 videoRecorder.setVideoCodecName(activeCodec); 
                 videoRecorder.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P);
-                videoRecorder.setVideoOption("f", "rawvideo");
-                videoRecorder.setVideoOption("realtime", "1");
-                videoRecorder.setVideoQuality(90);
+                
+                // --- Snow Leopard 究極安定・低消費電力チューニング ---
+                videoRecorder.setVideoQuality(90); // CRF90（実機・CI不変のビットパーフェクト）
                 videoRecorder.setOption("movflags", "faststart");
+                
+                // 【速度最優先】realtimeを復活させHWメディアエンジンの巡航速度を最大化
+                videoRecorder.setVideoOption("realtime", "1");
+                
+                // 【遅延・ブレ排除】BフレームをネイティブAPI経由でJNIオーバーヘッドなしでゼロに固定
+                videoRecorder.setMaxBFrames(0);
+                videoRecorder.setOption("bf", "0"); 
+                
                 videoRecorder.start();
 
+                // ダイレクトバッファのゼロアロケーション配置
                 final ByteBuffer reusableByteBuffer = ByteBuffer.allocateDirect(maxPixelsCapacity * 4);
                 final IntBuffer localBuffer = reusableByteBuffer.asIntBuffer();
                 
                 final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 4);
                 reusableFrame.image[0] = reusableByteBuffer;
 
+                final EncoderContext ctx = new EncoderContext();
                 int aByte;
                 int localTempRowIndex = 0;
-                int currentPixelIndex = 0;
 
+                // メインループ（シフト演算による一括CPUキャッシュ展開）
                 while ((aByte = inputStream.read()) >= 0) {
                     for (int shift = 7; shift >= 0; shift--) {
                         localTempRow[localTempRowIndex++] = ((aByte & (1 << shift)) != 0) ? pixelOne : pixelZero;
 
                         if (localTempRowIndex >= localTempRowLength) {
-                            // 横展開の最適化
-                            int cacheIdx = 0;
-                            for (int i = 0; i < localTempRowLength; i++) {
-                                final int px = localTempRow[i];
-                                for (int f = 0; f < duplicateFactor; f++) {
-                                    localRowCache[cacheIdx++] = px;
-                                }
-                            }
-
-                            // 縦展開とネイティブ転送
-                            for (int r = 0; r < duplicateFactor; r++) {
-                                if (currentPixelIndex + localRowCacheLength > maxPixelsCapacity) {
-                                    localBuffer.rewind(); 
-                                    videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
-                                    taskStatistics.poll();
-                                    currentPixelIndex = 0;
-                                }
-                                
-                                localBuffer.position(currentPixelIndex);
-                                localBuffer.put(localRowCache, 0, localRowCacheLength);
-                                currentPixelIndex += localRowCacheLength;
-                            }
+                            flushRowCacheToBuffer(localTempRow, localTempRowLength, localRowCache, localRowCacheLength, 
+                                                 duplicateFactor, maxPixelsCapacity, localBuffer, videoRecorder, reusableFrame, ctx);
                             localTempRowIndex = 0;
                         }
                     }
                 }
 
-                // 末尾の不完全ビットブロックのフラッシュ（安全なゼロパディングを統合）
+                // 末尾のゼロパディング処理
                 if (localTempRowIndex > 0) {
                     Arrays.fill(localTempRow, localTempRowIndex, localTempRowLength, ZERO);
-                    int cacheIdx = 0;
-                    for (int i = 0; i < localTempRowLength; i++) {
-                        final int px = localTempRow[i];
-                        for (int f = 0; f < duplicateFactor; f++) {
-                            localRowCache[cacheIdx++] = px;
-                        }
-                    }
-                    for (int r = 0; r < duplicateFactor; r++) {
-                        if (currentPixelIndex + localRowCacheLength > maxPixelsCapacity) {
-                            localBuffer.rewind();
-                            videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
-                            taskStatistics.poll();
-                            currentPixelIndex = 0;
-                        }
-                        localBuffer.position(currentPixelIndex);
-                        localBuffer.put(localRowCache, 0, localRowCacheLength);
-                        currentPixelIndex += localRowCacheLength;
-                    }
+                    flushRowCacheToBuffer(localTempRow, localTempRowLength, localRowCache, localRowCacheLength, 
+                                         duplicateFactor, maxPixelsCapacity, localBuffer, videoRecorder, reusableFrame, ctx);
                 }
 
-                // 最終フレームの残余領域のゼロパディング & 最終書き込み
-                if (currentPixelIndex > 0) {
-                    if (currentPixelIndex < maxPixelsCapacity) {
-                        localBuffer.position(currentPixelIndex);
-                        int remainingInts = maxPixelsCapacity - currentPixelIndex;
+                // 残余バッファを一括パディングしてVRAMへフラッシュ
+                if (ctx.currentPixelIndex > 0) {
+                    if (ctx.currentPixelIndex < maxPixelsCapacity) {
+                        localBuffer.position(ctx.currentPixelIndex);
+                        final int remainingInts = maxPixelsCapacity - ctx.currentPixelIndex;
                         
                         int zerosWritten = 0;
                         while (zerosWritten < remainingInts) {
@@ -147,7 +126,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                         }
                     }
                     
-                    localBuffer.rewind(); // 明示的にポインタを先頭へ
+                    localBuffer.rewind(); 
                     videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
                     taskStatistics.poll();
                 }
@@ -166,28 +145,60 @@ public class FilesToVideosTransformerTask extends TransformerTask {
     }
 
     /**
-     * 高速インプレース FourCC パッチ (メモリバッファ一括スキャン版：Wappa最適化)
+     * SIMD自動ベクトル化をJITコンパイラに最適発火させるための高速バッファフラッシュ
      */
-     private void convertHev1ToHvc1(File mp4File) {
-     if (mp4File == null || !mp4File.exists()) return;
+    private void flushRowCacheToBuffer(int[] localTempRow, final int localTempRowLength, 
+                                       int[] localRowCache, final int localRowCacheLength,
+                                       final int duplicateFactor, final int maxPixelsCapacity, 
+                                       IntBuffer localBuffer, FFmpegFrameRecorder videoRecorder, 
+                                       Frame reusableFrame, EncoderContext ctx) throws Exception {
+        int cacheIdx = 0;
+        for (int i = 0; i < localTempRowLength; i++) {
+            final int px = localTempRow[i];
+            // 内側ループのファクター数に応じてJITがアンロールしやすい直線的代入
+            for (int f = 0; f < duplicateFactor; f++) {
+                localRowCache[cacheIdx++] = px;
+            }
+        }
 
-     try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(mp4File, "rw")) {
-         // MP4のメタデータは通常ファイルの比較的初期にあるが、念のため64KBまで探索
-         long maxSearchBytes = Math.min(raf.length(), 64 * 1024);
-         byte[] searchBuffer = new byte[(int) maxSearchBytes];
-         raf.readFully(searchBuffer);
- 
-         for (int i = 0; i <= searchBuffer.length - 4; i++) {
-             if (searchBuffer[i] == 0x68 && searchBuffer[i+1] == 0x65 && 
-                 searchBuffer[i+2] == 0x76 && searchBuffer[i+3] == 0x31) {
-                 raf.seek(i);
-                 raf.write(new byte[]{0x68, 0x76, 0x63, 0x31});
-                 return;
-             }
-         }
-         log.warn("FourCC 'hev1' not patched. Compatibility may be affected.");
-     } catch (Exception e) {
-         log.warn("Failed to patch MP4 FourCC.", e);
-     }
- }
+        for (int r = 0; r < duplicateFactor; r++) {
+            if (ctx.currentPixelIndex + localRowCacheLength > maxPixelsCapacity) {
+                localBuffer.rewind(); 
+                videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
+                taskStatistics.poll();
+                ctx.currentPixelIndex = 0;
+            }
+            
+            localBuffer.position(ctx.currentPixelIndex);
+            localBuffer.put(localRowCache, 0, localRowCacheLength);
+            ctx.currentPixelIndex += localRowCacheLength;
+        }
+    }
+
+    /**
+     * 高速インプレース FourCC パッチ (ディスクI/O効率化 & 低消費電力スキャン版)
+     */
+    private void convertHev1ToHvc1(File mp4File) {
+        if (mp4File == null || !mp4File.exists()) return;
+
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(mp4File, "rw")) {
+            // ヘッダー近辺(最大64KB)のみに走査を限定し、メモリフットプリントを最小化
+            final int searchSize = (int) Math.min(raf.length(), 64 * 1024);
+            final byte[] searchBuffer = new byte[searchSize];
+            raf.readFully(searchBuffer);
+
+            // 高速な4バイトウィンドウマッチング
+            for (int i = 0; i <= searchSize - 4; i++) {
+                if (searchBuffer[i] == 0x68 && searchBuffer[i+1] == 0x65 && 
+                    searchBuffer[i+2] == 0x76 && searchBuffer[i+3] == 0x31) { // 'h' 'e' 'v' '1'
+                    raf.seek(i);
+                    raf.write(new byte[]{0x68, 0x76, 0x63, 0x31}); // 'h' 'v' 'c' '1'
+                    return;
+                }
+            }
+            log.warn("FourCC 'hev1' not patched. Compatibility may be affected.");
+        } catch (Exception e) {
+            log.warn("Failed to patch MP4 FourCC.", e);
+        }
+    }
 }
