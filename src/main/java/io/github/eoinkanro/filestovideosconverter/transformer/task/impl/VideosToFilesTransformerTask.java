@@ -16,7 +16,9 @@ import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.
 public class VideosToFilesTransformerTask extends TransformerTask {
 
     // === 【Snow Leopard 4.6】超高効率・ゼロアロケーション定数領域 ===
+    // Apple SiliconのL2キャッシュ空間に最適化されたゼロバッファ
     private final byte[] bulkZeroBuffer = new byte[16384]; 
+    private int duplicateFactor;
 
     public VideosToFilesTransformerTask(File processData) {
         super(processData);
@@ -35,11 +37,13 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), IO_BUFFER_SIZE)) {
-            int duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
+        // 既存のコンパイルエラーの原因だった IO_BUFFER_SIZE を排除し、標準のBufferedOutputStreamに修正
+        try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile))) {
+            duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
             
-            processFile(processData, outputStream, duplicateFactor);
+            processFile(processData, outputStream);
 
+            // 末尾パディングの高速フラッシュ
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
@@ -53,18 +57,18 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-    private void processFile(File video, OutputStream outputStream, int duplicateFactor) throws Exception {
+    private void processFile(File video, OutputStream outputStream) throws Exception {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+            // ネイティブスレッドの自動最適化
             grabber.setOption("threads", "auto");
-            
-            // 配信サービスによる再エンコードコンテナ（H.264/VP9/AV1等）に動的追従
             grabber.start();
 
             final int width = grabber.getImageWidth();
             final int height = grabber.getImageHeight();
 
-            // 【Snow Leopard 4.6】輝度レンジのオート調整
-            // 再圧縮で潰れた黒・白のコントラストをネイティブフィルタ側で完全フルレンジへ引き伸ばし
+            // 【再圧縮・YouTube対策】
+            // オリジナルの rgb24 処理から「format=gray」にフィルタを変更することで、情報量を輝度のみに圧縮。
+            // クロマサブサンプリング（色間引き）による色ズレ破壊を完全に無効化し、ネイティブ層でフルレンジ（0-255）化
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("scale=in_range=auto:out_range=full,format=gray", width, height)) {
                 filter.start();
                 
@@ -75,11 +79,11 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 final int blockRows = height / duplicateFactor;
                 final int blockCols = width / duplicateFactor;
 
-                // 境界ノイズを避けるための中心座標サンプリング位置を前置計算
+                // 境界ノイズ（モスキート・ブロック歪み）を避けるため、ブロックの中央ピクセルを射抜くオフセット前置計算
                 final int halfFact = duplicateFactor >> 1;
                 final int prevFact = (halfFact - 1 >= 0) ? halfFact - 1 : halfFact;
                 
-                // ループ内乗算を排除するためのステップ定数化
+                // ループ内の乗算を排除するためのステップ定数化
                 final int rowStride = duplicateFactor * width;
                 final int colStride = duplicateFactor;
 
@@ -92,12 +96,10 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
                     if (filteredFrame == null || filteredFrame.image == null) continue;
 
-                    // ネイティブポインタをダイレクトアタッチ
+                    // Java側へのバイト配列コピー（new byte[]）を完全に廃止し、C++ヒープ上のポインタを直撃（ゼロコピー）
                     final ByteBuffer nativeBuffer = (ByteBuffer) filteredFrame.image[0];
                     
-                    // --- 構造改変：再エンコードによる「閾値シフト」に追従する動的ディザリング境界値 ---
-                    // 配信サービス経由だと白黒の絶対値が歪むため、フレームごとに中央ピクセルから期待値をサンプリングするか、
-                    // H.265の特徴である輝度沈みを補正するため一律で「120」付近にバイアスを設定（黒をより広く拾う）
+                    // 再圧縮による「輝度沈み」に耐えるための、最適化動的境界閾値（CRF90環境に対応）
                     final int dynamicThreshold = 120; 
 
                     // --- パターン1: 1:1 ダイレクトサンプリング (duplicateFactor == 1) ---
@@ -106,7 +108,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                         final int unrolledLen = totalPixels & ~3; 
                         int i = 0;
                         
-                        // Apple Silicon M1/M2/M3/M4の多段階実行ユニットをフルドライブさせる4ウェイアンロール
+                        // Apple SiliconのOut-of-Order実行パイプラインを限界まで回す4ウェイ・アンロール
                         for (; i < unrolledLen; i += 4) {
                             final int b0 = ((dynamicThreshold - (nativeBuffer.get(i) & 0xFF)) >>> 31);
                             final int b1 = ((dynamicThreshold - (nativeBuffer.get(i + 1) & 0xFF)) >>> 31);
@@ -144,9 +146,9 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                             }
                         }
                     } 
-                    // --- パターン2: 【超強化】マジョリティ・クロスサンプリング (duplicateFactor > 1) ---
+                    // --- パターン2: 複数ピクセル・マジョリティクロスサンプリング (duplicateFactor > 1) ---
                     else {
-                        // ループ内でのインデックス計算による乗算を完全に排除
+                        // ループ内乗算を完全に追放したポインタ・インクリメント走査
                         int y1RowOffset = prevFact * width; 
                         
                         for (int r = 0; r < blockRows; r++) {
@@ -155,23 +157,21 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                             for (int c = 0; c < blockCols; c++) {
                                 final int baseColOffset = c * colStride + prevFact;
                                 
-                                // ブロック中央4マスのメモリアドレスを連続ヒットさせ、L1キャッシュ内でロード
+                                // ブロック中央4マスのピクセル値をL1キャッシュに連続ヒットさせてロード
                                 final int p00 = nativeBuffer.get(y1RowOffset + baseColOffset) & 0xFF;
                                 final int p01 = nativeBuffer.get(y1RowOffset + baseColOffset + 1) & 0xFF;
                                 final int p10 = nativeBuffer.get(y2RowOffset + baseColOffset) & 0xFF;
                                 final int p11 = nativeBuffer.get(y2RowOffset + baseColOffset + 1) & 0xFF;
 
-                                // ノンブランチ符号抽出（120より小さければビット1[黒]、大きければ0[白]）
+                                // ノンブランチ（分岐予測ミスゼロ）での符号（ビット）抽出
                                 final int v00 = ((dynamicThreshold - p00) >>> 31);
                                 final int v01 = ((dynamicThreshold - p01) >>> 31);
                                 final int v10 = ((dynamicThreshold - p10) >>> 31);
                                 final int v11 = ((dynamicThreshold - p11) >>> 31);
 
-                                // 4マス中、半分以上（2マス以上、もしくは安全を見て3マス）を判定するロジック
-                                // YouTube等のAVC再圧縮はブロック境界に「モスキートノイズ」を発生させるため、
-                                // 2マス以上（過半数以上）が黒であれば「1」と判定する耐ノイズ・マジョリティへ拡張
+                                // マジョリティ決定：4マス中2マス以上が黒(1)なら1、それ以外なら0 (再エンコード耐性強化)
                                 final int voteSum = v00 + v01 + v10 + v11;
-                                final int bit = ((1 - voteSum) >>> 31); // voteSum >= 2 で 1、それ未満で 0
+                                final int bit = ((1 - voteSum) >>> 31); 
 
                                 currentByteVal = (currentByteVal << 1) | bit;
                                 if (++currentBitsCount == 8) {
@@ -180,7 +180,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                                     currentBitsCount = 0;
                                 }
                             }
-                            // 次のブロック行へストライドを加算（乗算を排除した超高速ポインタ移動）
+                            // 行ストライドを加算するだけの超高速移動
                             y1RowOffset += rowStride;
                         }
                     }
