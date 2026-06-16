@@ -11,13 +11,23 @@ import java.io.*;
 import java.nio.ByteBuffer;
 
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.VIDEOS_PATH;
+import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_BGR24;
 
 @Log4j2
 public class VideosToFilesTransformerTask extends TransformerTask {
 
-    // === 【Snow Leopard 4.6】ゼロアロケーション用定数領域 ===
-    private final byte[] bulkZeroBuffer = new byte[16384]; 
+    private static final int RGB_CHANNELS = 3;
+
     private int duplicateFactor;
+    private int imageWidth;
+
+    private StringBuilder byteBuilder;
+    private long zeroBytesCount;
+
+    private byte[] pixels;
+    private int pixelsLastIndex;
+
+    private int frameType;
 
     public VideosToFilesTransformerTask(File processData) {
         super(processData);
@@ -38,12 +48,11 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
         try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile))) {
             duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
-            
             processFile(processData, outputStream);
 
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
-            if (lastZeroBytesCount > 0) {
-                writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
+            for (int i = 0; i < lastZeroBytesCount; i++) {
+                outputStream.write(0);
             }
         } catch (Exception e) {
             log.error(COMMON_EXCEPTION_DESCRIPTION, e);
@@ -54,100 +63,176 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-    private void processFile(File video, OutputStream outputStream) throws Exception {
-        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
-            grabber.setOption("threads", "auto");
+    /**
+     * Write bits from pixels of images from video to file
+     *
+     * @param video        - video
+     * @param outputStream - result file
+     * @throws IOException - if something goes wrong with writing file
+     */
+    private void processFile(File video, OutputStream outputStream) throws IOException {
+        try(FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
             grabber.start();
+            frameType = grabber.getPixelFormat();
 
-            final int width = grabber.getImageWidth();
-            final int height = grabber.getImageHeight();
-
-            // MPEGレンジをフルレンジへ引き戻し、輝度プレーンのみに絞る
-            try (FFmpegFrameFilter filter = new FFmpegFrameFilter("scale=in_range=auto:out_range=full,format=gray", width, height)) {
+            try(FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
                 filter.start();
-                
-                int currentBitsCount = 0;
-                int currentByteVal = 0;
-                long zeroBytesCount = 0;
 
-                final int blockRows = height / duplicateFactor;
-                final int blockCols = width / duplicateFactor;
+                processFile(grabber, filter, outputStream);
+            }
+        }
+    }
 
-                final int halfFact = duplicateFactor >> 1;
-                final int prevFact = (halfFact - 1 >= 0) ? halfFact - 1 : halfFact;
+    private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
+        Frame frame;
+        while ((frame = grabber.grabFrame()) != null) {
+            imageWidth = frame.imageWidth;
 
-                Frame frame;
-                while ((frame = grabber.grabFrame()) != null) {
-                    if (frame.image == null) continue; 
+            filter.push(frame);
+            frame = filter.pull();
 
-                    filter.push(frame);
-                    Frame filteredFrame = filter.pull();
+            if (frame.type != null) {
+                continue;
+            }
 
-                    if (filteredFrame == null || filteredFrame.image == null) continue;
+            pixels = new byte[frame.imageHeight * frame.imageWidth * RGB_CHANNELS];
+            ((ByteBuffer) frame.image[0]).get(pixels);
 
-                    // ゼロコピー・ネイティブバッファ直撃
-                    final ByteBuffer nativeBuffer = (ByteBuffer) filteredFrame.image[0];
-                    
-                    // 【修正】バイアスを排除し、0-255の数学的中心（127）にリセット
-                    // これにより圧縮ノイズが上下どちらに振れても、均等に耐性を維持します
-                    final int standardThreshold = 127;
+            processImage(outputStream);
 
-                    for (int r = 0; r < blockRows; r++) {
-                        final int targetY = r * duplicateFactor + prevFact;
-                        final int rowOffset = targetY * width;
+            taskStatistics.poll();
+        }
+    }
 
-                        for (int c = 0; c < blockCols; c++) {
-                            final int targetX = c * duplicateFactor + prevFact;
-                            
-                            // 輝度（0〜255）を取得
-                            final int pixelVal = nativeBuffer.get(rowOffset + targetX) & 0xFF;
+    /**
+     * Process one image from video
+     *
+     * @param outputStream - result file
+     * @throws IOException - if bytes can't be written to result file
+     */
+    private void processImage(OutputStream outputStream) throws IOException {
+        int pixelsIterations = pixels.length / imageWidth / RGB_CHANNELS / duplicateFactor;
+        clearContextTempVariables();
 
-                            // 127以下（暗い＝黒）ならビット1、127より大きい（明るい＝白）ならビット0
-                            final int bit = (pixelVal <= standardThreshold) ? 1 : 0;
+        for (int i = 0; i < pixelsIterations; i++) {
+            byte[][] copiedRows = copyPixelRowsFromImage();
 
-                            currentByteVal = (currentByteVal << 1) | bit;
-                            if (++currentBitsCount == 8) {
-                                zeroBytesCount = appendByteToStream(currentByteVal, zeroBytesCount, outputStream);
-                                currentByteVal = 0;
-                                currentBitsCount = 0;
-                            }
-                        }
+            int[] bitsRow = transformToBitRow(copiedRows, duplicateFactor);
+            for (int bit : bitsRow) {
+                if (bit >= 0) {
+                    byteBuilder.append(bit);
+                }
+
+                if (byteBuilder.length() >= 8) {
+                    int aByte = Integer.parseInt(byteBuilder.toString(), 2);
+                    if (aByte == 0) {
+                        zeroBytesCount++;
+                        byteBuilder = new StringBuilder();
+                        continue;
                     }
-                    taskStatistics.poll();
-                }
 
-                if (currentBitsCount > 0) {
-                    int finalByte = currentByteVal << (8 - currentBitsCount);
-                    zeroBytesCount = appendByteToStream(finalByte, zeroBytesCount, outputStream);
-                }
-                
-                if (zeroBytesCount > 0) {
-                    writeZeroBytesWithCount(zeroBytesCount, outputStream);
+                    writeZeroBytes(zeroBytesCount, outputStream);
+                    outputStream.write(aByte);
+
+                    zeroBytesCount = 0;
+                    byteBuilder = new StringBuilder();
                 }
             }
         }
     }
 
-    private long appendByteToStream(int byteVal, long zeroBytesCount, OutputStream outputStream) throws IOException {
-        if (byteVal == 0) {
-            return zeroBytesCount + 1;
-        }
-        if (zeroBytesCount > 0) {
-            writeZeroBytesWithCount(zeroBytesCount, outputStream);
-        }
-        outputStream.write(byteVal);
-        return 0;
+    /**
+     * Clear temp variables of context
+     */
+    private void clearContextTempVariables() {
+        byteBuilder = new StringBuilder();
+        pixelsLastIndex = 0;
     }
 
-    private long writeZeroBytesWithCount(long count, OutputStream outputStream) throws IOException {
-        long remaining = count;
-        final int bufferLength = bulkZeroBuffer.length;
+    /**
+     * Copy several rows of image pixels using duplicate factor
+     *
+     * @return - several image rows
+     */
+    private byte[][] copyPixelRowsFromImage() {
+        byte[][] result = new byte[duplicateFactor][];
 
-        while (remaining > 0) {
-            final int bytesToWrite = (int) Math.min(remaining, bufferLength);
-            outputStream.write(bulkZeroBuffer, 0, bytesToWrite);
-            remaining -= bytesToWrite;
+        for (int i = 0; i < result.length; i++) {
+            result[i] = copyPixelRowFromImage(pixels, pixelsLastIndex, imageWidth);
+            pixelsLastIndex = pixelsLastIndex + imageWidth * RGB_CHANNELS;
         }
-        return 0; 
+        return result;
+    }
+
+    /**
+     * Copy one row of image
+     *
+     * @param width - width of image
+     * @return - one image row
+     */
+    private byte[] copyPixelRowFromImage(byte[] pixels, int pixelsLastIndex, int width) {
+        byte[] result = new byte[width * RGB_CHANNELS];
+        int copyIndex = 0;
+
+        for (int i = pixelsLastIndex; i < pixelsLastIndex + width * RGB_CHANNELS; i++) {
+            result[copyIndex] = pixels[i];
+            copyIndex++;
+        }
+        return result;
+    }
+
+    /**
+     * Transform several rows of image pixels to one row of bits
+     * using duplicate factor
+     *
+     * @param copiedRows      - several rows of image
+     * @param duplicateFactor - duplicate factor of image
+     * @return - row of bits
+     */
+    private int[] transformToBitRow(byte[][] copiedRows, int duplicateFactor) {
+        int[] result = new int[copiedRows[0].length / RGB_CHANNELS / duplicateFactor];
+
+        int pixelSum = 0;
+        int duplicateFactorIterations = 0;
+        int resultIndex = 0;
+
+        int currentIndex = 0;
+        while (currentIndex < copiedRows[0].length) {
+            if (duplicateFactorIterations >= duplicateFactor) {
+                result[resultIndex] = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
+                resultIndex++;
+                duplicateFactorIterations = 0;
+                pixelSum = 0;
+            }
+
+            for (byte[] row : copiedRows) {
+                if (frameType == AV_PIX_FMT_BGR24) {
+                    pixelSum += bytesUtils.pixelToBit(row[currentIndex + 2], row[currentIndex + 1], row[currentIndex]);
+                } else {
+                    pixelSum += bytesUtils.pixelToBit(row[currentIndex], row[currentIndex + 1], row[currentIndex + 2]);
+                }
+            }
+
+            currentIndex += 3;
+            duplicateFactorIterations++;
+        }
+
+        if (duplicateFactorIterations >= duplicateFactor) {
+            result[resultIndex] = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
+        }
+        return result;
+    }
+
+    /**
+     * Write count of zero bytes to file
+     *
+     * @param zeroBytesCount - count of zero bytes
+     * @param outputStream - result file
+     * @throws IOException - if bytes can't be written
+     */
+    private void writeZeroBytes(long zeroBytesCount, OutputStream outputStream) throws IOException {
+        for (long i = 0; i < zeroBytesCount; i++) {
+            outputStream.write(0);
+        }
     }
 }
