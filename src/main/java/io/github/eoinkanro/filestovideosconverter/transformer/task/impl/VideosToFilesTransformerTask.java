@@ -18,18 +18,19 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
 
+    // === ゼロアロケーション用キャッシュバッファ ===
+    private final byte[] bulkZeroBuffer = new byte[16384];
     private byte[] pixelsCache = new byte[0];
 
     private int duplicateFactor;
     private int imageWidth;
 
+    // ビットストリーム・状態管理用
     private int currentBitsCount;
     private int currentByteVal;
+    private long zeroBytesCount;
 
     private int frameType;
-    
-    // 書き込みバイト数の追跡用
-    private long totalBytesWritten;
 
     public VideosToFilesTransformerTask(File processData) {
         super(processData);
@@ -48,39 +49,36 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
-        int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
-
-        // 状態初期化
-        currentBitsCount = 0;
-        currentByteVal = 0;
-        totalBytesWritten = 0;
-
-        // 一旦すべてのデータをテンポラリ出力、または直接書き出し
+        // 64KBバッファで I/O コストを削減
         try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
-            
+            duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
+
+            // 状態初期化
+            currentBitsCount = 0;
+            currentByteVal = 0;
+            zeroBytesCount = 0;
+
             processFile(processData, outputStream);
 
-            // 残った端数ビットの書き出し
+            // 残った端数ビットの処理
             if (currentBitsCount > 0) {
                 currentByteVal <<= (8 - currentBitsCount);
-                outputStream.write(currentByteVal);
-                totalBytesWritten++;
+                appendByteToStream(currentByteVal, outputStream);
                 currentByteVal = 0;
                 currentBitsCount = 0;
+            }
+
+            // 動画末尾のパディングゼロ（zeroBytesCountに溜まった分）は書き出さずに破棄。
+            // 元ファイルに存在していた末尾ゼロ（-zXXで記録された分）のみ復元する。
+            int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
+            if (lastZeroBytesCount > 0) {
+                writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
             }
 
             outputStream.flush();
         } catch (Exception e) {
             log.error(COMMON_EXCEPTION_DESCRIPTION, e);
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
-        }
-
-        // === 重要: 動画フレームのあまり（パディング）部分を削る処理 ===
-        // デコード結果が「元サイズ + 最終フレームの余白」になっているため、
-        // 最後に lastZeroBytesCount (またはフレーム余白) 分を切り詰め (Truncate) ます。
-        if (lastZeroBytesCount > 0 && resultFile.exists()) {
-            trimFileTail(resultFile, lastZeroBytesCount);
         }
 
         taskStatistics.logResult();
@@ -156,8 +154,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                     currentByteVal = (currentByteVal << 1) | bit;
 
                     if (++currentBitsCount == 8) {
-                        outputStream.write(currentByteVal);
-                        totalBytesWritten++;
+                        appendByteToStream(currentByteVal, outputStream);
                         currentByteVal = 0;
                         currentBitsCount = 0;
                     }
@@ -167,16 +164,29 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     }
 
     /**
-     * ファイル末尾の不要なパディング（6.6KB分など）を削り落とす
+     * ゼロバイトの遅延書き込み処理。
+     * 動画末尾のパディングゼロを自動的に除去するために必須。
      */
-    private void trimFileTail(File file, long bytesToTrim) {
-        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
-            long currentLength = raf.length();
-            long newLength = Math.max(0, currentLength - bytesToTrim);
-            raf.setLength(newLength);
-            log.info("Trimmed file {} from {} to {} bytes (removed {} bytes)", file.getName(), currentLength, newLength, bytesToTrim);
-        } catch (IOException e) {
-            log.error("Failed to trim file tail for {}", file, e);
+    private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
+        if (byteVal == 0) {
+            zeroBytesCount++;
+            return;
+        }
+        if (zeroBytesCount > 0) {
+            writeZeroBytesWithCount(zeroBytesCount, outputStream);
+            zeroBytesCount = 0;
+        }
+        outputStream.write(byteVal);
+    }
+
+    private void writeZeroBytesWithCount(long count, OutputStream outputStream) throws IOException {
+        long remaining = count;
+        final int bufferLength = bulkZeroBuffer.length;
+
+        while (remaining > 0) {
+            final int bytesToWrite = (int) Math.min(remaining, bufferLength);
+            outputStream.write(bulkZeroBuffer, 0, bytesToWrite);
+            remaining -= bytesToWrite;
         }
     }
 }
