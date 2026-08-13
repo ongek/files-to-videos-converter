@@ -115,31 +115,65 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             }
             ((ByteBuffer) frame.image[0]).get(pixelsCache, 0, requiredPixelsLength);
 
-            processImageUltraFast(requiredPixelsLength, outputStream);
+            processImageLimit(requiredPixelsLength, outputStream);
 
             taskStatistics.poll();
         }
     }
 
     /**
-     * JIT最適化・ポインタ加算スタイルに磨き上げた極限処理ロジック
+     * duplicateFactorの分岐を備えた最高速度処理ロジック
      */
-    private void processImageUltraFast(int pixelsLength, OutputStream outputStream) throws IOException {
+    private void processImageLimit(int pixelsLength, OutputStream outputStream) throws IOException {
         final int df = duplicateFactor;
-        final int rowStride = imageWidth * RGB_CHANNELS;
-        final int pixelsIterations = pixelsLength / rowStride / df;
-        final int bitsPerRow = imageWidth / df;
 
-        // カラーフォーマットに応じたチャンネルオフセットの事前決定 (最内層分岐排除)
+        // カラーフォーマットに応じたチャンネルオフセット
         final int rOffset = (frameType == AV_PIX_FMT_BGR24) ? 2 : 0;
         final int gOffset = 1;
         final int bOffset = (frameType == AV_PIX_FMT_BGR24) ? 0 : 2;
 
-        final int colByteStride = df * RGB_CHANNELS;
-        final int blockRowStride = df * rowStride;
-
         int bitCount = this.currentBitsCount;
         int byteVal = this.currentByteVal;
+
+        // =========================================================================
+        // FAST PATH: duplicateFactor == 1 (ブロック計算を全スキップし、1次元リニアスキャン)
+        // =========================================================================
+        if (df == 1) {
+            final byte[] cache = pixelsCache;
+            for (int addr = 0; addr < pixelsLength; addr += RGB_CHANNELS) {
+                int pBit = bytesUtils.pixelToBit(
+                        cache[addr + rOffset],
+                        cache[addr + gOffset],
+                        cache[addr + bOffset]
+                );
+
+                int bit = bytesUtils.pixelToBit(pBit, 1);
+                if (bit >= 0) {
+                    byteVal = (byteVal << 1) | bit;
+
+                    if (++bitCount == 8) {
+                        appendByteToStream(byteVal, outputStream);
+                        byteVal = 0;
+                        bitCount = 0;
+                    }
+                }
+            }
+
+            this.currentBitsCount = bitCount;
+            this.currentByteVal = byteVal;
+            return;
+        }
+
+        // =========================================================================
+        // SLOW PATH: duplicateFactor > 1 (加算のみのポインタ的走査)
+        // =========================================================================
+        final int rowStride = imageWidth * RGB_CHANNELS;
+        final int pixelsIterations = pixelsLength / rowStride / df;
+        final int bitsPerRow = imageWidth / df;
+
+        final int colByteStride = df * RGB_CHANNELS;
+        final int blockRowStride = df * rowStride;
+        final byte[] cache = pixelsCache;
 
         for (int i = 0; i < pixelsIterations; i++) {
             final int blockStartByte = i * blockRowStride;
@@ -148,22 +182,20 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 final int colByte = b * colByteStride;
                 int pixelSum = 0;
 
-                // === 最内層：乗算を排除し、加算（ポインタのインクリメント風）のみに変換 ===
                 int rowAddr = blockStartByte + colByte;
                 for (int r = 0; r < df; r++) {
                     int addr = rowAddr;
                     for (int c = 0; c < df; c++) {
                         pixelSum += bytesUtils.pixelToBit(
-                                pixelsCache[addr + rOffset],
-                                pixelsCache[addr + gOffset],
-                                pixelsCache[addr + bOffset]
+                                cache[addr + rOffset],
+                                cache[addr + gOffset],
+                                cache[addr + bOffset]
                         );
-                        addr += RGB_CHANNELS; // 加算のみ (+3)
+                        addr += RGB_CHANNELS;
                     }
-                    rowAddr += rowStride;     // 加算のみ (+rowStride)
+                    rowAddr += rowStride;
                 }
 
-                // ビット判定
                 int bit = bytesUtils.pixelToBit(pixelSum, df);
 
                 if (bit >= 0) {
@@ -178,13 +210,12 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             }
         }
 
-        // 状態をフィールドへ復元
         this.currentBitsCount = bitCount;
         this.currentByteVal = byteVal;
     }
 
     /**
-     * ゼロバイト遅延書き込み処理（動画末尾ゴミ破棄用）
+     * ゼロバイト遅延書き込み処理
      */
     private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
         if (byteVal == 0) {
