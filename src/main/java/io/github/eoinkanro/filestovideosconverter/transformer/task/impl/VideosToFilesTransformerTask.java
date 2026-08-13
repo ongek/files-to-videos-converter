@@ -18,13 +18,18 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
 
-    // === ゼロアロケーション用キャッシュバッファ ===
-    private final byte[] bulkZeroBuffer = new byte[16384];
+    // === ゼロアロケーション用キャッシュバッファ（メモリ使い回しのみ） ===
     private byte[] pixelsCache = new byte[0];
+    private final byte[] bulkZeroBuffer = new byte[16384];
 
-    // ビットストリーム累積状態（全フレーム間で保持）
-    private int currentByteVal;
+    private int duplicateFactor;
+    private int imageWidth;
+
+    // ビットストリーム・状態管理用
     private int currentBitsCount;
+    private int currentByteVal;
+
+    private int frameType;
 
     public VideosToFilesTransformerTask(File processData) {
         super(processData);
@@ -43,17 +48,17 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        // 64KB メモリバッファで I/O コストを最小化
+        // 64KB メモリバッファで I/O を高速化しつつ、書き込みは直接行って整合性を保証
         try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
-            int duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
+            duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
 
-            // ビット蓄積状態の初期化
-            currentByteVal = 0;
+            // 状態初期化
             currentBitsCount = 0;
+            currentByteVal = 0;
 
-            processFile(processData, duplicateFactor, outputStream);
+            processFile(processData, outputStream);
 
-            // 残った端数ビットのフラッシュ処理
+            // 8ビットに満たず残った最終端数ビットのフラッシュ処理
             if (currentBitsCount > 0) {
                 currentByteVal <<= (8 - currentBitsCount);
                 outputStream.write(currentByteVal);
@@ -61,7 +66,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 currentBitsCount = 0;
             }
 
-            // 元ファイル末尾のゼロパディング書き込み
+            // 末尾パディングの書き出し
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
@@ -75,55 +80,47 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-    private void processFile(File video, int duplicateFactor, OutputStream outputStream) throws IOException {
+    private void processFile(File video, OutputStream outputStream) throws IOException {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
             grabber.setOption("threads", "auto");
             grabber.start();
-
-            int frameType = grabber.getPixelFormat();
+            frameType = grabber.getPixelFormat();
 
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
                 filter.start();
-
-                Frame frame;
-                while ((frame = grabber.grabFrame()) != null) {
-                    filter.push(frame);
-
-                    Frame filteredFrame;
-                    while ((filteredFrame = filter.pull()) != null) {
-                        processFilteredFrame(filteredFrame, frameType, duplicateFactor, outputStream);
-                    }
-                }
-
-                // フィルタ内に残った最終フレーム群を完全フラッシュ
-                filter.push(null);
-                Frame filteredFrame;
-                while ((filteredFrame = filter.pull()) != null) {
-                    processFilteredFrame(filteredFrame, frameType, duplicateFactor, outputStream);
-                }
+                processFile(grabber, filter, outputStream);
             }
         }
     }
 
-    private void processFilteredFrame(Frame filteredFrame, int frameType, int duplicateFactor, OutputStream outputStream) throws IOException {
-        if (filteredFrame.image == null || filteredFrame.image.length == 0) {
-            return;
+    private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
+        Frame frame;
+        while ((frame = grabber.grabFrame()) != null) {
+            imageWidth = frame.imageWidth;
+
+            filter.push(frame);
+            frame = filter.pull();
+
+            if (frame.type != null) {
+                continue;
+            }
+
+            // 配列の使い回し（ヒープアロケーションの全廃）
+            int requiredPixelsLength = frame.imageHeight * frame.imageWidth * RGB_CHANNELS;
+            if (pixelsCache.length < requiredPixelsLength) {
+                pixelsCache = new byte[requiredPixelsLength];
+            }
+            ((ByteBuffer) frame.image[0]).get(pixelsCache, 0, requiredPixelsLength);
+
+            processImage(requiredPixelsLength, outputStream);
+
+            taskStatistics.poll();
         }
+    }
 
-        int imageWidth = filteredFrame.imageWidth;
-        int imageHeight = filteredFrame.imageHeight;
-        int requiredPixelsLength = imageHeight * imageWidth * RGB_CHANNELS;
-
-        if (pixelsCache.length < requiredPixelsLength) {
-            pixelsCache = new byte[requiredPixelsLength];
-        }
-
-        ByteBuffer bb = (ByteBuffer) filteredFrame.image[0];
-        bb.position(0);
-        bb.get(pixelsCache, 0, requiredPixelsLength);
-
+    private void processImage(int pixelsLength, OutputStream outputStream) throws IOException {
         int rowStride = imageWidth * RGB_CHANNELS;
-        int pixelsIterations = imageHeight / duplicateFactor;
+        int pixelsIterations = pixelsLength / rowStride / duplicateFactor;
         int bitsPerRow = imageWidth / duplicateFactor;
 
         for (int i = 0; i < pixelsIterations; i++) {
@@ -153,6 +150,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                     currentByteVal = (currentByteVal << 1) | bit;
 
                     if (++currentBitsCount == 8) {
+                        // 状態バッファを挟まず、1バイトできたら即座に OutputStream へ送る
                         outputStream.write(currentByteVal);
                         currentByteVal = 0;
                         currentBitsCount = 0;
@@ -160,8 +158,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 }
             }
         }
-
-        taskStatistics.poll();
     }
 
     private void writeZeroBytesWithCount(long count, OutputStream outputStream) throws IOException {
