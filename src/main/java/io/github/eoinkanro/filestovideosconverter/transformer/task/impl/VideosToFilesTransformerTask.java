@@ -20,7 +20,11 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     // === ゼロアロケーション用キャッシュバッファ ===
     private final byte[] bulkZeroBuffer = new byte[16384];
-    private byte[] pixelsCache = new byte[0]; // フレームサイズに応じて使い回すバッファ
+    private byte[] pixelsCache = new byte[0];
+
+    // ビットストリーム累積状態（全フレーム間で保持）
+    private int currentByteVal;
+    private int currentBitsCount;
 
     public VideosToFilesTransformerTask(File processData) {
         super(processData);
@@ -39,13 +43,25 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        // 64KBバッファでファイル出力I/Oを高速化
+        // 64KB メモリバッファで I/O コストを最小化
         try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
             int duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
 
+            // ビット蓄積状態の初期化
+            currentByteVal = 0;
+            currentBitsCount = 0;
+
             processFile(processData, duplicateFactor, outputStream);
 
-            // 末尾パディングの書き出し
+            // 残った端数ビットのフラッシュ処理
+            if (currentBitsCount > 0) {
+                currentByteVal <<= (8 - currentBitsCount);
+                outputStream.write(currentByteVal);
+                currentByteVal = 0;
+                currentBitsCount = 0;
+            }
+
+            // 元ファイル末尾のゼロパディング書き込み
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
@@ -64,103 +80,88 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             grabber.setOption("threads", "auto");
             grabber.start();
 
-            // FFmpegFrameFilter により色空間を確実に RGB24 へ統一
+            int frameType = grabber.getPixelFormat();
+
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
                 filter.start();
-
-                int currentByteVal = 0;
-                int currentBitsCount = 0;
-                long zeroBytesCount = 0;
 
                 Frame frame;
                 while ((frame = grabber.grabFrame()) != null) {
                     filter.push(frame);
-                    Frame filteredFrame = filter.pull();
 
-                    if (filteredFrame == null || filteredFrame.image == null || filteredFrame.image.length == 0) {
-                        continue;
-                    }
-
-                    int imageWidth = filteredFrame.imageWidth;
-                    int imageHeight = filteredFrame.imageHeight;
-                    int requiredPixelsLength = imageHeight * imageWidth * RGB_CHANNELS;
-
-                    // ヒープアロケーションの全廃（既存配列の再利用）
-                    if (pixelsCache.length < requiredPixelsLength) {
-                        pixelsCache = new byte[requiredPixelsLength];
-                    }
-                    ((ByteBuffer) filteredFrame.image[0]).get(pixelsCache, 0, requiredPixelsLength);
-
-                    int frameType = grabber.getPixelFormat();
-                    int rowStride = imageWidth * RGB_CHANNELS;
-                    int pixelsIterations = imageHeight / duplicateFactor;
-                    int bitsPerRow = imageWidth / duplicateFactor;
-
-                    for (int i = 0; i < pixelsIterations; i++) {
-                        int blockStartByte = i * duplicateFactor * rowStride;
-
-                        for (int b = 0; b < bitsPerRow; b++) {
-                            int pixelSum = 0;
-                            int colByte = b * duplicateFactor * RGB_CHANNELS;
-
-                            for (int r = 0; r < duplicateFactor; r++) {
-                                int rowByte = blockStartByte + (r * rowStride) + colByte;
-
-                                for (int c = 0; c < duplicateFactor; c++) {
-                                    int pixelAddr = rowByte + (c * RGB_CHANNELS);
-
-                                    // 本来の bytesUtils.pixelToBit ロジックを正確に呼び出し
-                                    if (frameType == AV_PIX_FMT_BGR24) {
-                                        pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr + 2], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr]);
-                                    } else {
-                                        pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr + 2]);
-                                    }
-                                }
-                            }
-
-                            int bit = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
-
-                            if (bit >= 0) {
-                                // 高速ビットシフト演算
-                                currentByteVal = (currentByteVal << 1) | bit;
-
-                                if (++currentBitsCount == 8) {
-                                    if (currentByteVal == 0) {
-                                        zeroBytesCount++;
-                                    } else {
-                                        if (zeroBytesCount > 0) {
-                                            writeZeroBytesWithCount(zeroBytesCount, outputStream);
-                                            zeroBytesCount = 0;
-                                        }
-                                        outputStream.write(currentByteVal);
-                                    }
-                                    currentByteVal = 0;
-                                    currentBitsCount = 0;
-                                }
-                            }
-                        }
-                    }
-                    taskStatistics.poll();
-                }
-
-                // 残りビットの書き出し
-                if (currentBitsCount > 0) {
-                    int finalByte = currentByteVal << (8 - currentBitsCount);
-                    if (finalByte == 0) {
-                        zeroBytesCount++;
-                    } else {
-                        if (zeroBytesCount > 0) {
-                            writeZeroBytesWithCount(zeroBytesCount, outputStream);
-                            zeroBytesCount = 0;
-                        }
-                        outputStream.write(finalByte);
+                    Frame filteredFrame;
+                    while ((filteredFrame = filter.pull()) != null) {
+                        processFilteredFrame(filteredFrame, frameType, duplicateFactor, outputStream);
                     }
                 }
-                if (zeroBytesCount > 0) {
-                    writeZeroBytesWithCount(zeroBytesCount, outputStream);
+
+                // フィルタ内に残った最終フレーム群を完全フラッシュ
+                filter.push(null);
+                Frame filteredFrame;
+                while ((filteredFrame = filter.pull()) != null) {
+                    processFilteredFrame(filteredFrame, frameType, duplicateFactor, outputStream);
                 }
             }
         }
+    }
+
+    private void processFilteredFrame(Frame filteredFrame, int frameType, int duplicateFactor, OutputStream outputStream) throws IOException {
+        if (filteredFrame.image == null || filteredFrame.image.length == 0) {
+            return;
+        }
+
+        int imageWidth = filteredFrame.imageWidth;
+        int imageHeight = filteredFrame.imageHeight;
+        int requiredPixelsLength = imageHeight * imageWidth * RGB_CHANNELS;
+
+        if (pixelsCache.length < requiredPixelsLength) {
+            pixelsCache = new byte[requiredPixelsLength];
+        }
+
+        ByteBuffer bb = (ByteBuffer) filteredFrame.image[0];
+        bb.position(0);
+        bb.get(pixelsCache, 0, requiredPixelsLength);
+
+        int rowStride = imageWidth * RGB_CHANNELS;
+        int pixelsIterations = imageHeight / duplicateFactor;
+        int bitsPerRow = imageWidth / duplicateFactor;
+
+        for (int i = 0; i < pixelsIterations; i++) {
+            int blockStartByte = i * duplicateFactor * rowStride;
+
+            for (int b = 0; b < bitsPerRow; b++) {
+                int pixelSum = 0;
+                int colByte = b * duplicateFactor * RGB_CHANNELS;
+
+                for (int r = 0; r < duplicateFactor; r++) {
+                    int rowByte = blockStartByte + (r * rowStride) + colByte;
+
+                    for (int c = 0; c < duplicateFactor; c++) {
+                        int pixelAddr = rowByte + (c * RGB_CHANNELS);
+
+                        if (frameType == AV_PIX_FMT_BGR24) {
+                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr + 2], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr]);
+                        } else {
+                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr + 2]);
+                        }
+                    }
+                }
+
+                int bit = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
+
+                if (bit >= 0) {
+                    currentByteVal = (currentByteVal << 1) | bit;
+
+                    if (++currentBitsCount == 8) {
+                        outputStream.write(currentByteVal);
+                        currentByteVal = 0;
+                        currentBitsCount = 0;
+                    }
+                }
+            }
+        }
+
+        taskStatistics.poll();
     }
 
     private void writeZeroBytesWithCount(long count, OutputStream outputStream) throws IOException {
