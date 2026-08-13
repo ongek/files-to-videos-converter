@@ -18,14 +18,17 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
 
+    // === ゼロアロケーション用キャッシュバッファ ===
+    private final byte[] bulkZeroBuffer = new byte[16384]; 
+    private byte[] pixelsCache = new byte[0]; // フレームサイズに応じて再利用されるバッファ
+
     private int duplicateFactor;
     private int imageWidth;
 
-    private StringBuilder byteBuilder;
+    // ビットストリーム・状態管理用
+    private int currentBitsCount;
+    private int currentByteVal;
     private long zeroBytesCount;
-
-    private byte[] pixels;
-    private int pixelsLastIndex;
 
     private int frameType;
 
@@ -46,13 +49,21 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile))) {
+        // Output Buffer を 64KB に拡張して I/O コストを削減
+        try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
             duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
+            
+            // 状態初期化
+            currentBitsCount = 0;
+            currentByteVal = 0;
+            zeroBytesCount = 0;
+
             processFile(processData, outputStream);
 
+            // 末尾パディングの高速フラッシュ
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
-            for (int i = 0; i < lastZeroBytesCount; i++) {
-                outputStream.write(0);
+            if (lastZeroBytesCount > 0) {
+                writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
             }
         } catch (Exception e) {
             log.error(COMMON_EXCEPTION_DESCRIPTION, e);
@@ -63,21 +74,14 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-    /**
-     * Write bits from pixels of images from video to file
-     *
-     * @param video        - video
-     * @param outputStream - result file
-     * @throws IOException - if something goes wrong with writing file
-     */
     private void processFile(File video, OutputStream outputStream) throws IOException {
-        try(FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+            grabber.setOption("threads", "auto"); // M4のマルチコアを活用
             grabber.start();
             frameType = grabber.getPixelFormat();
 
-            try(FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
+            try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
                 filter.start();
-
                 processFile(grabber, filter, outputStream);
             }
         }
@@ -95,144 +99,82 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 continue;
             }
 
-            pixels = new byte[frame.imageHeight * frame.imageWidth * RGB_CHANNELS];
-            ((ByteBuffer) frame.image[0]).get(pixels);
+            // 配列の再生成を回避し、必要な時だけバッファを拡張
+            int requiredPixelsLength = frame.imageHeight * frame.imageWidth * RGB_CHANNELS;
+            if (pixelsCache.length < requiredPixelsLength) {
+                pixelsCache = new byte[requiredPixelsLength];
+            }
+            ((ByteBuffer) frame.image[0]).get(pixelsCache, 0, requiredPixelsLength);
 
-            processImage(outputStream);
+            processImage(requiredPixelsLength, outputStream);
 
             taskStatistics.poll();
         }
     }
 
-    /**
-     * Process one image from video
-     *
-     * @param outputStream - result file
-     * @throws IOException - if bytes can't be written to result file
-     */
-    private void processImage(OutputStream outputStream) throws IOException {
-        int pixelsIterations = pixels.length / imageWidth / RGB_CHANNELS / duplicateFactor;
-        clearContextTempVariables();
+    private void processImage(int pixelsLength, OutputStream outputStream) throws IOException {
+        int rowStride = imageWidth * RGB_CHANNELS;
+        int pixelsIterations = pixelsLength / rowStride / duplicateFactor; // 垂直方向のブロック数
+        int bitsPerRow = imageWidth / duplicateFactor;                    // 水平方向のビット数
 
         for (int i = 0; i < pixelsIterations; i++) {
-            byte[][] copiedRows = copyPixelRowsFromImage();
+            int blockStartByte = i * duplicateFactor * rowStride;
 
-            int[] bitsRow = transformToBitRow(copiedRows, duplicateFactor);
-            for (int bit : bitsRow) {
-                if (bit >= 0) {
-                    byteBuilder.append(bit);
-                }
+            for (int b = 0; b < bitsPerRow; b++) {
+                int pixelSum = 0;
+                int colByte = b * duplicateFactor * RGB_CHANNELS;
 
-                if (byteBuilder.length() >= 8) {
-                    int aByte = Integer.parseInt(byteBuilder.toString(), 2);
-                    if (aByte == 0) {
-                        zeroBytesCount++;
-                        byteBuilder = new StringBuilder();
-                        continue;
+                // duplicateFactor x duplicateFactor のピクセル正方形領域を直接集計
+                for (int r = 0; r < duplicateFactor; r++) {
+                    int rowByte = blockStartByte + (r * rowStride) + colByte;
+
+                    for (int c = 0; c < duplicateFactor; c++) {
+                        int pixelAddr = rowByte + (c * RGB_CHANNELS);
+
+                        if (frameType == AV_PIX_FMT_BGR24) {
+                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr + 2], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr]);
+                        } else {
+                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr + 2]);
+                        }
                     }
+                }
 
-                    writeZeroBytes(zeroBytesCount, outputStream);
-                    outputStream.write(aByte);
+                // ビットの決定
+                int bit = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
 
-                    zeroBytesCount = 0;
-                    byteBuilder = new StringBuilder();
+                if (bit >= 0) {
+                    currentByteVal = (currentByteVal << 1) | bit;
+
+                    if (++currentBitsCount == 8) {
+                        appendByteToStream(currentByteVal, outputStream);
+                        currentByteVal = 0;
+                        currentBitsCount = 0;
+                    }
                 }
             }
         }
     }
 
-    /**
-     * Clear temp variables of context
-     */
-    private void clearContextTempVariables() {
-        byteBuilder = new StringBuilder();
-        pixelsLastIndex = 0;
+    private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
+        if (byteVal == 0) {
+            zeroBytesCount++;
+            return;
+        }
+        if (zeroBytesCount > 0) {
+            writeZeroBytesWithCount(zeroBytesCount, outputStream);
+            zeroBytesCount = 0;
+        }
+        outputStream.write(byteVal);
     }
 
-    /**
-     * Copy several rows of image pixels using duplicate factor
-     *
-     * @return - several image rows
-     */
-    private byte[][] copyPixelRowsFromImage() {
-        byte[][] result = new byte[duplicateFactor][];
+    private void writeZeroBytesWithCount(long count, OutputStream outputStream) throws IOException {
+        long remaining = count;
+        final int bufferLength = bulkZeroBuffer.length;
 
-        for (int i = 0; i < result.length; i++) {
-            result[i] = copyPixelRowFromImage(pixels, pixelsLastIndex, imageWidth);
-            pixelsLastIndex = pixelsLastIndex + imageWidth * RGB_CHANNELS;
-        }
-        return result;
-    }
-
-    /**
-     * Copy one row of image
-     *
-     * @param width - width of image
-     * @return - one image row
-     */
-    private byte[] copyPixelRowFromImage(byte[] pixels, int pixelsLastIndex, int width) {
-        byte[] result = new byte[width * RGB_CHANNELS];
-        int copyIndex = 0;
-
-        for (int i = pixelsLastIndex; i < pixelsLastIndex + width * RGB_CHANNELS; i++) {
-            result[copyIndex] = pixels[i];
-            copyIndex++;
-        }
-        return result;
-    }
-
-    /**
-     * Transform several rows of image pixels to one row of bits
-     * using duplicate factor
-     *
-     * @param copiedRows      - several rows of image
-     * @param duplicateFactor - duplicate factor of image
-     * @return - row of bits
-     */
-    private int[] transformToBitRow(byte[][] copiedRows, int duplicateFactor) {
-        int[] result = new int[copiedRows[0].length / RGB_CHANNELS / duplicateFactor];
-
-        int pixelSum = 0;
-        int duplicateFactorIterations = 0;
-        int resultIndex = 0;
-
-        int currentIndex = 0;
-        while (currentIndex < copiedRows[0].length) {
-            if (duplicateFactorIterations >= duplicateFactor) {
-                result[resultIndex] = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
-                resultIndex++;
-                duplicateFactorIterations = 0;
-                pixelSum = 0;
-            }
-
-            for (byte[] row : copiedRows) {
-                if (frameType == AV_PIX_FMT_BGR24) {
-                    pixelSum += bytesUtils.pixelToBit(row[currentIndex + 2], row[currentIndex + 1], row[currentIndex]);
-                } else {
-                    pixelSum += bytesUtils.pixelToBit(row[currentIndex], row[currentIndex + 1], row[currentIndex + 2]);
-                }
-            }
-
-            currentIndex += 3;
-            duplicateFactorIterations++;
-        }
-
-        if (duplicateFactorIterations >= duplicateFactor) {
-            result[resultIndex] = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
-        }
-        return result;
-    }
-
-    /**
-     * Write count of zero bytes to file
-     *
-     * @param zeroBytesCount - count of zero bytes
-     * @param outputStream - result file
-     * @throws IOException - if bytes can't be written
-     */
-    private void writeZeroBytes(long zeroBytesCount, OutputStream outputStream) throws IOException {
-        for (long i = 0; i < zeroBytesCount; i++) {
-            outputStream.write(0);
+        while (remaining > 0) {
+            final int bytesToWrite = (int) Math.min(remaining, bufferLength);
+            outputStream.write(bulkZeroBuffer, 0, bytesToWrite);
+            remaining -= bytesToWrite;
         }
     }
 }
