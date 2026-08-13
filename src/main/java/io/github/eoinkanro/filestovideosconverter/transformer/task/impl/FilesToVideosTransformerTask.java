@@ -9,8 +9,10 @@ import org.bytedeco.javacv.Frame;
 import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
-import java.nio.IntBuffer;
 import java.util.Arrays;
 
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.*;
@@ -21,7 +23,7 @@ import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGB32_1;
 public class FilesToVideosTransformerTask extends TransformerTask {
 
     private static final int IO_BUFFER_SIZE = 1024 * 1024;
-    private static final int READ_CHUNK_SIZE = 65536; // 一括読み込みバッファサイズ (64KB)
+    private static final int READ_CHUNK_SIZE = 65536; // 64KB ディスク一括バッファ
 
     private static final class EncoderContext {
         int currentPixelIndex = 0;
@@ -57,8 +59,14 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         try {
             resultVideoFile = fileUtils.getFilesToVideosResultFile(processData, localLastZeroBytesCount);
 
-            try (BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData), IO_BUFFER_SIZE);
+            // 【Java 26 FFM API】Arena でネイティブメモリのライフサイクルを完全自動管理 (GCゼロ)
+            try (Arena arena = Arena.ofConfined();
+                 BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData), IO_BUFFER_SIZE);
                  FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(resultVideoFile, imgWidth, imgHeight)) {
+
+                // 【M4 アーキテクチャ最適化】64バイトアライメント（M4のL1/L2キャッシュラインサイズ）でネイティブ領域確保
+                final MemorySegment nativePixelSegment = arena.allocate((long) maxPixelsCapacity * 4, 64);
+                final ByteBuffer reusableByteBuffer = nativePixelSegment.asByteBuffer();
 
                 videoRecorder.setFormat("mp4");
                 videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
@@ -76,17 +84,12 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
                 videoRecorder.start();
 
-                // ダイレクトバッファ配置
-                final ByteBuffer reusableByteBuffer = ByteBuffer.allocateDirect(maxPixelsCapacity * 4);
-                final IntBuffer localBuffer = reusableByteBuffer.asIntBuffer();
-
                 final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 4);
                 reusableFrame.image[0] = reusableByteBuffer;
 
                 final EncoderContext ctx = new EncoderContext();
                 int localTempRowIndex = 0;
 
-                // 【改善1】一括ディスク読み込みバッファ（1バイトごとのread()メソッド呼出を完全排除）
                 final byte[] readBuffer = new byte[READ_CHUNK_SIZE];
                 int bytesRead;
 
@@ -94,7 +97,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                     for (int i = 0; i < bytesRead; i++) {
                         final int aByte = readBuffer[i] & 0xFF;
 
-                        // ビット展開の直線化
+                        // M4のパイプライン処理に最適化された直列化アンロール
                         localTempRow[localTempRowIndex++] = ((aByte & 0x80) != 0) ? pixelOne : pixelZero;
                         localTempRow[localTempRowIndex++] = ((aByte & 0x40) != 0) ? pixelOne : pixelZero;
                         localTempRow[localTempRowIndex++] = ((aByte & 0x20) != 0) ? pixelOne : pixelZero;
@@ -105,8 +108,8 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                         localTempRow[localTempRowIndex++] = ((aByte & 0x01) != 0) ? pixelOne : pixelZero;
 
                         if (localTempRowIndex >= localTempRowLength) {
-                            flushRowCacheToBufferOptimized(localTempRow, localTempRowLength, localRowCache, localRowCacheLength,
-                                    duplicateFactor, maxPixelsCapacity, localBuffer, videoRecorder, reusableFrame, ctx);
+                            flushRowToNativeMemorySegment(localTempRow, localTempRowLength, localRowCache, localRowCacheLength,
+                                    duplicateFactor, maxPixelsCapacity, nativePixelSegment, videoRecorder, reusableFrame, ctx);
                             localTempRowIndex = 0;
                         }
                     }
@@ -115,26 +118,21 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 // 末尾のゼロパディング処理
                 if (localTempRowIndex > 0) {
                     Arrays.fill(localTempRow, localTempRowIndex, localTempRowLength, ZERO);
-                    flushRowCacheToBufferOptimized(localTempRow, localTempRowLength, localRowCache, localRowCacheLength,
-                            duplicateFactor, maxPixelsCapacity, localBuffer, videoRecorder, reusableFrame, ctx);
+                    flushRowToNativeMemorySegment(localTempRow, localTempRowLength, localRowCache, localRowCacheLength,
+                            duplicateFactor, maxPixelsCapacity, nativePixelSegment, videoRecorder, reusableFrame, ctx);
                 }
 
-                // 残余バッファを一括パディングしてVRAMへフラッシュ
+                // 残余バッファを一括パディングしてVRAM/エンコーダへフラッシュ
                 if (ctx.currentPixelIndex > 0) {
                     if (ctx.currentPixelIndex < maxPixelsCapacity) {
-                        localBuffer.position(ctx.currentPixelIndex);
                         final int remainingInts = maxPixelsCapacity - ctx.currentPixelIndex;
 
-                        int zerosWritten = 0;
-                        while (zerosWritten < remainingInts) {
-                            int chunk = Math.min(remainingInts - zerosWritten, localRowCacheLength);
-                            Arrays.fill(localRowCache, 0, chunk, ZERO);
-                            localBuffer.put(localRowCache, 0, chunk);
-                            zerosWritten += chunk;
-                        }
+                        // MemorySegment.fill によるハードウェア一括メモリ埋め (0xFF)
+                        long offsetBytes = (long) ctx.currentPixelIndex * 4;
+                        long lengthBytes = (long) remainingInts * 4;
+                        nativePixelSegment.asSlice(offsetBytes, lengthBytes).fill((byte) 0xFF);
                     }
 
-                    localBuffer.rewind();
                     videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
                     taskStatistics.poll();
                 }
@@ -153,27 +151,26 @@ public class FilesToVideosTransformerTask extends TransformerTask {
     }
 
     /**
-     * 【改善2 & 3】duplicateFactor分岐およびIntBuffer書き込み最適化
+     * 【Java 26 FFM API】MemorySegment への直接バルクコピー
+     * (NIO IntBuffer 境界チェックと JNI オーバーヘッドを完全排除)
      */
-    private void flushRowCacheToBufferOptimized(int[] localTempRow, final int localTempRowLength,
-                                               int[] localRowCache, final int localRowCacheLength,
-                                               final int duplicateFactor, final int maxPixelsCapacity,
-                                               IntBuffer localBuffer, FFmpegFrameRecorder videoRecorder,
-                                               Frame reusableFrame, EncoderContext ctx) throws Exception {
+    private void flushRowToNativeMemorySegment(int[] localTempRow, final int localTempRowLength,
+                                                int[] localRowCache, final int localRowCacheLength,
+                                                final int duplicateFactor, final int maxPixelsCapacity,
+                                                MemorySegment nativePixelSegment, FFmpegFrameRecorder videoRecorder,
+                                                Frame reusableFrame, EncoderContext ctx) throws Exception {
 
         // --- FAST PATH: duplicateFactor == 1 ---
         if (duplicateFactor == 1) {
-            for (int r = 0; r < 1; r++) {
-                if (ctx.currentPixelIndex + localTempRowLength > maxPixelsCapacity) {
-                    localBuffer.rewind();
-                    videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
-                    taskStatistics.poll();
-                    ctx.currentPixelIndex = 0;
-                }
-                localBuffer.position(ctx.currentPixelIndex);
-                localBuffer.put(localTempRow, 0, localTempRowLength);
-                ctx.currentPixelIndex += localTempRowLength;
+            if (ctx.currentPixelIndex + localTempRowLength > maxPixelsCapacity) {
+                videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
+                taskStatistics.poll();
+                ctx.currentPixelIndex = 0;
             }
+
+            // Java 26 FFM API: JITがARM64のSIMD一括ストア命令(stp/memcpy)に直接変換
+            MemorySegment.copy(localTempRow, 0, nativePixelSegment, ValueLayout.JAVA_INT, (long) ctx.currentPixelIndex * 4, localTempRowLength);
+            ctx.currentPixelIndex += localTempRowLength;
             return;
         }
 
@@ -188,14 +185,12 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
         for (int r = 0; r < duplicateFactor; r++) {
             if (ctx.currentPixelIndex + localRowCacheLength > maxPixelsCapacity) {
-                localBuffer.rewind();
                 videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
                 taskStatistics.poll();
                 ctx.currentPixelIndex = 0;
             }
 
-            localBuffer.position(ctx.currentPixelIndex);
-            localBuffer.put(localRowCache, 0, localRowCacheLength);
+            MemorySegment.copy(localRowCache, 0, nativePixelSegment, ValueLayout.JAVA_INT, (long) ctx.currentPixelIndex * 4, localRowCacheLength);
             ctx.currentPixelIndex += localRowCacheLength;
         }
     }
