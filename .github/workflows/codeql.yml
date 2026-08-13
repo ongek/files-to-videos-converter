@@ -11,7 +11,7 @@ jobs:
     runs-on: macos-latest
     env:
       AV_LOG_FORCE_NOCOLOR: 1
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
         echo "VIDEO_DIR=$VIDEO_DIR" >> $GITHUB_ENV
         echo "=== CHECK GENERATED VIDEO DETAILS ==="
         ls -la "$VIDEO_DIR"
-        
+
     - name: Execute Videos-To-Files Conversion (Decode)
       run: |
         echo "=== STARTING DECODE ==="
@@ -85,7 +85,20 @@ jobs:
         fi
 
     # =================================================================
-    # 整合性が100%確認できた安全なビルド成果物のみを圧縮・保存
+    # 失敗時デバッグ用: 動画・元ファイル・復元ファイルをダウンロード可能にする
+    # =================================================================
+    - name: Archive Failure Debug Artifacts
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: integrity-failure-debug-files
+        path: |
+          test_workspace/
+          resultVideos*/**
+          resultFiles*/**
+
+    # =================================================================
+    # 整合性が100%確認できた安全なビルド成果物のみを圧縮・保存 (成功時のみ)
     # =================================================================
     - name: Tar & Zstd compression
       run: |
