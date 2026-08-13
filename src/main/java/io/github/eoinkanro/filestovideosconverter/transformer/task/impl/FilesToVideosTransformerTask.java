@@ -17,7 +17,7 @@ import java.util.Arrays;
 
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.*;
 import static io.github.eoinkanro.filestovideosconverter.utils.BytesUtils.ZERO;
-import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGB32_1;
+import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGBA;
 
 @Log4j2
 public class FilesToVideosTransformerTask extends TransformerTask {
@@ -133,7 +133,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                         nativePixelSegment.asSlice(offsetBytes, lengthBytes).fill((byte) 0xFF);
                     }
 
-                    videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
+                    videoRecorder.record(reusableFrame, org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGBA);
                     taskStatistics.poll();
                 }
             }
@@ -163,7 +163,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         // --- FAST PATH: duplicateFactor == 1 ---
         if (duplicateFactor == 1) {
             if (ctx.currentPixelIndex + localTempRowLength > maxPixelsCapacity) {
-                videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
+                videoRecorder.record(reusableFrame, org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGBA);
                 taskStatistics.poll();
                 ctx.currentPixelIndex = 0;
             }
@@ -185,7 +185,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
         for (int r = 0; r < duplicateFactor; r++) {
             if (ctx.currentPixelIndex + localRowCacheLength > maxPixelsCapacity) {
-                videoRecorder.record(reusableFrame, AV_PIX_FMT_RGB32_1);
+                videoRecorder.record(reusableFrame, org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGBA);
                 taskStatistics.poll();
                 ctx.currentPixelIndex = 0;
             }
