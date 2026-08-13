@@ -49,7 +49,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        // 64KBバッファで I/O コストを削減
+        // Output Buffer を 64KB に拡張して I/O コストを削減
         try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
             duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
 
@@ -60,7 +60,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
             processFile(processData, outputStream);
 
-            // 残った端数ビットの処理
+            // 残った端数ビットの処理（フレーム・画像終端の整合性維持）
             if (currentBitsCount > 0) {
                 currentByteVal <<= (8 - currentBitsCount);
                 appendByteToStream(currentByteVal, outputStream);
@@ -68,8 +68,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 currentBitsCount = 0;
             }
 
-            // 動画末尾のパディングゼロ（zeroBytesCountに溜まった分）は書き出さずに破棄。
-            // 元ファイルに存在していた末尾ゼロ（-zXXで記録された分）のみ復元する。
+            // 元ファイルに存在していた末尾ゼロ（-zXXで記録された分）のみ復元
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
@@ -116,56 +115,111 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             }
             ((ByteBuffer) frame.image[0]).get(pixelsCache, 0, requiredPixelsLength);
 
-            processImage(requiredPixelsLength, outputStream);
+            processImageOptimized(requiredPixelsLength, outputStream);
 
             taskStatistics.poll();
         }
     }
 
-    private void processImage(int pixelsLength, OutputStream outputStream) throws IOException {
-        int rowStride = imageWidth * RGB_CHANNELS;
-        int pixelsIterations = pixelsLength / rowStride / duplicateFactor;
-        int bitsPerRow = imageWidth / duplicateFactor;
+    /**
+     * 超高速化された画像判定・ビット復元ロジック
+     */
+    private void processImageOptimized(int pixelsLength, OutputStream outputStream) throws IOException {
+        final int df = duplicateFactor;
+        final int rowStride = imageWidth * RGB_CHANNELS;
+        final int pixelsIterations = pixelsLength / rowStride / df;
+        final int bitsPerRow = imageWidth / df;
+
+        // 1. カラーフォーマットに応じたチャンネルオフセットの事前計算 (If文排除)
+        final int rOffset = (frameType == AV_PIX_FMT_BGR24) ? 2 : 0;
+        final int gOffset = 1;
+        final int bOffset = (frameType == AV_PIX_FMT_BGR24) ? 0 : 2;
+
+        final int colByteStride = df * RGB_CHANNELS;
+        final int blockRowStride = df * rowStride;
+
+        // 2. 8ビット一括処理用の指標計算
+        final int fullBytesPerRow = bitsPerRow >> 3; // bitsPerRow / 8
+        final int remainingBits = bitsPerRow & 7;    // bitsPerRow % 8
+
+        int bitCount = currentBitsCount;
+        int byteVal = currentByteVal;
 
         for (int i = 0; i < pixelsIterations; i++) {
-            int blockStartByte = i * duplicateFactor * rowStride;
+            int blockStartByte = i * blockRowStride;
+            int bitIdx = 0;
 
-            for (int b = 0; b < bitsPerRow; b++) {
-                int pixelSum = 0;
-                int colByte = b * duplicateFactor * RGB_CHANNELS;
+            // --- Fast Path: 8ビット（1バイト）を直接組み立てて出力（bitCount == 0 の時） ---
+            if (bitCount == 0 && fullBytesPerRow > 0) {
+                for (int byteIdx = 0; byteIdx < fullBytesPerRow; byteIdx++) {
+                    int constructedByte = 0;
 
-                for (int r = 0; r < duplicateFactor; r++) {
-                    int rowByte = blockStartByte + (r * rowStride) + colByte;
+                    for (int b = 0; b < 8; b++) {
+                        int colByte = bitIdx * colByteStride;
+                        int pixelSum = 0;
 
-                    for (int c = 0; c < duplicateFactor; c++) {
-                        int pixelAddr = rowByte + (c * RGB_CHANNELS);
+                        for (int r = 0; r < df; r++) {
+                            int rowAddr = blockStartByte + (r * rowStride) + colByte;
 
-                        if (frameType == AV_PIX_FMT_BGR24) {
-                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr + 2], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr]);
-                        } else {
-                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr + 2]);
+                            for (int c = 0; c < df; c++) {
+                                int addr = rowAddr + (c * RGB_CHANNELS);
+                                pixelSum += bytesUtils.pixelToBit(
+                                        pixelsCache[addr + rOffset],
+                                        pixelsCache[addr + gOffset],
+                                        pixelsCache[addr + bOffset]
+                                );
+                            }
                         }
+
+                        int bit = bytesUtils.pixelToBit(pixelSum, df);
+                        constructedByte = (constructedByte << 1) | (bit & 1);
+                        bitIdx++;
+                    }
+
+                    // 1バイト完成。カウントチェック無しで即時出力ストリームへ保留・書き出し
+                    appendByteToStream(constructedByte, outputStream);
+                }
+            }
+
+            // --- Slow Path / 残余ビット処理（端数ビットが存在する場合や、行末の余り） ---
+            for (; bitIdx < bitsPerRow; bitIdx++) {
+                int colByte = bitIdx * colByteStride;
+                int pixelSum = 0;
+
+                for (int r = 0; r < df; r++) {
+                    int rowAddr = blockStartByte + (r * rowStride) + colByte;
+
+                    for (int c = 0; c < df; c++) {
+                        int addr = rowAddr + (c * RGB_CHANNELS);
+                        pixelSum += bytesUtils.pixelToBit(
+                                pixelsCache[addr + rOffset],
+                                pixelsCache[addr + gOffset],
+                                pixelsCache[addr + bOffset]
+                        );
                     }
                 }
 
-                int bit = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
+                int bit = bytesUtils.pixelToBit(pixelSum, df);
 
                 if (bit >= 0) {
-                    currentByteVal = (currentByteVal << 1) | bit;
+                    byteVal = (byteVal << 1) | bit;
 
-                    if (++currentBitsCount == 8) {
-                        appendByteToStream(currentByteVal, outputStream);
-                        currentByteVal = 0;
-                        currentBitsCount = 0;
+                    if (++bitCount == 8) {
+                        appendByteToStream(byteVal, outputStream);
+                        byteVal = 0;
+                        bitCount = 0;
                     }
                 }
             }
         }
+
+        // 状態の書き戻し
+        this.currentBitsCount = bitCount;
+        this.currentByteVal = byteVal;
     }
 
     /**
-     * ゼロバイトの遅延書き込み処理。
-     * 動画末尾のパディングゼロを自動的に除去するために必須。
+     * ゼロバイト遅延書き込み処理
      */
     private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
         if (byteVal == 0) {
