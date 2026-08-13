@@ -18,7 +18,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
 
-    // === ゼロアロケーション用キャッシュバッファ（メモリ使い回しのみ） ===
+    // === ゼロアロケーション用キャッシュバッファ ===
     private byte[] pixelsCache = new byte[0];
     private final byte[] bulkZeroBuffer = new byte[16384];
 
@@ -48,7 +48,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        // 64KB メモリバッファで I/O を高速化しつつ、書き込みは直接行って整合性を保証
         try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
             duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
 
@@ -58,7 +57,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
             processFile(processData, outputStream);
 
-            // 8ビットに満たず残った最終端数ビットのフラッシュ処理
+            // 残った端数ビットのフラッシュ処理
             if (currentBitsCount > 0) {
                 currentByteVal <<= (8 - currentBitsCount);
                 outputStream.write(currentByteVal);
@@ -66,10 +65,14 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 currentBitsCount = 0;
             }
 
+            // バッファを確実にディスクへ書き出し
+            outputStream.flush();
+
             // 末尾パディングの書き出し
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
+                outputStream.flush();
             }
         } catch (Exception e) {
             log.error(COMMON_EXCEPTION_DESCRIPTION, e);
@@ -105,7 +108,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 continue;
             }
 
-            // 配列の使い回し（ヒープアロケーションの全廃）
             int requiredPixelsLength = frame.imageHeight * frame.imageWidth * RGB_CHANNELS;
             if (pixelsCache.length < requiredPixelsLength) {
                 pixelsCache = new byte[requiredPixelsLength];
@@ -150,7 +152,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                     currentByteVal = (currentByteVal << 1) | bit;
 
                     if (++currentBitsCount == 8) {
-                        // 状態バッファを挟まず、1バイトできたら即座に OutputStream へ送る
                         outputStream.write(currentByteVal);
                         currentByteVal = 0;
                         currentBitsCount = 0;
