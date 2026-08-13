@@ -3,12 +3,14 @@ package io.github.eoinkanro.filestovideosconverter.transformer.task.impl;
 import io.github.eoinkanro.filestovideosconverter.transformer.TransformException;
 import io.github.eoinkanro.filestovideosconverter.transformer.task.TransformerTask;
 import lombok.extern.log4j.Log4j2;
-import org.bytedeco.javacv.FFmpegFrameFilter;
 import org.bytedeco.javacv.FFmpegFrameGrabber;
 import org.bytedeco.javacv.Frame;
+import sun.misc.Unsafe;
 
 import java.io.*;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
+import java.util.concurrent.*;
 
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.VIDEOS_PATH;
 import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_BGR24;
@@ -17,20 +19,20 @@ import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_BGR24;
 public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
+    private static final Unsafe UNSAFE;
+    private static final int QUEUE_CAPACITY = 16; // フレーム用パイプラインバッファ
 
-    // === ゼロアロケーション用キャッシュバッファ ===
-    private final byte[] bulkZeroBuffer = new byte[16384]; 
-    private byte[] pixelsCache = new byte[0]; // フレームサイズに応じて再利用されるバッファ
+    static {
+        try {
+            Field f = Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            UNSAFE = (Unsafe) f.get(null);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to initialize Unsafe", e);
+        }
+    }
 
-    private int duplicateFactor;
-    private int imageWidth;
-
-    // ビットストリーム・状態管理用
-    private int currentBitsCount;
-    private int currentByteVal;
-    private long zeroBytesCount;
-
-    private int frameType;
+    private final byte[] bulkZeroBuffer = new byte[16384];
 
     public VideosToFilesTransformerTask(File processData) {
         super(processData);
@@ -49,18 +51,13 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        // Output Buffer を 64KB に拡張して I/O コストを削減
         try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
-            duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
-            
-            // 状態初期化
-            currentBitsCount = 0;
-            currentByteVal = 0;
-            zeroBytesCount = 0;
+            int duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
 
-            processFile(processData, outputStream);
+            // パイプライン処理の実行
+            processPipeline(processData, duplicateFactor, outputStream);
 
-            // 末尾パディングの高速フラッシュ
+            // 末尾パディングの書き出し
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
@@ -74,97 +71,143 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-    private void processFile(File video, OutputStream outputStream) throws IOException {
-        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
-            grabber.setOption("threads", "auto"); // M4のマルチコアを活用
-            grabber.start();
-            frameType = grabber.getPixelFormat();
+    private void processPipeline(File video, int duplicateFactor, OutputStream outputStream) throws IOException {
+        BlockingQueue<FramePacket> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+        ExecutorService consumerExecutor = Executors.newSingleThreadExecutor();
 
-            try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
-                filter.start();
-                processFile(grabber, filter, outputStream);
-            }
-        }
-    }
+        // ----------------------------------------------------
+        // 【Consumer】スレッドB: ピクセル解析 & ファイル書き込み
+        // ----------------------------------------------------
+        Future<Void> consumerFuture = consumerExecutor.submit(() -> {
+            int currentByteVal = 0;
+            int currentBitsCount = 0;
+            long zeroBytesCount = 0;
 
-    private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
-        Frame frame;
-        while ((frame = grabber.grabFrame()) != null) {
-            imageWidth = frame.imageWidth;
+            // BytesUtils.ONE_MIN * duplicateFactor^2 の事前計算
+            long duplicateFactorPixels = (long) duplicateFactor * duplicateFactor;
+            long oneMinThreshold = duplicateFactorPixels * -8388609L;
 
-            filter.push(frame);
-            frame = filter.pull();
+            while (true) {
+                FramePacket packet = queue.take();
+                if (packet.isPoisonPill) break;
 
-            if (frame.type != null) {
-                continue;
-            }
+                long nativeAddr = packet.nativeAddress;
+                int imageWidth = packet.imageWidth;
+                int imageHeight = packet.imageHeight;
+                boolean isBGR = (packet.pixelFormat == AV_PIX_FMT_BGR24);
 
-            // 配列の再生成を回避し、必要な時だけバッファを拡張
-            int requiredPixelsLength = frame.imageHeight * frame.imageWidth * RGB_CHANNELS;
-            if (pixelsCache.length < requiredPixelsLength) {
-                pixelsCache = new byte[requiredPixelsLength];
-            }
-            ((ByteBuffer) frame.image[0]).get(pixelsCache, 0, requiredPixelsLength);
+                int rowStride = imageWidth * RGB_CHANNELS;
+                int pixelsIterations = imageHeight / duplicateFactor;
+                int bitsPerRow = imageWidth / duplicateFactor;
 
-            processImage(requiredPixelsLength, outputStream);
+                for (int i = 0; i < pixelsIterations; i++) {
+                    long blockStartAddr = nativeAddr + ((long) i * duplicateFactor * rowStride);
 
-            taskStatistics.poll();
-        }
-    }
+                    for (int b = 0; b < bitsPerRow; b++) {
+                        long pixelSum = 0;
+                        long colOffset = (long) b * duplicateFactor * RGB_CHANNELS;
 
-    private void processImage(int pixelsLength, OutputStream outputStream) throws IOException {
-        int rowStride = imageWidth * RGB_CHANNELS;
-        int pixelsIterations = pixelsLength / rowStride / duplicateFactor; // 垂直方向のブロック数
-        int bitsPerRow = imageWidth / duplicateFactor;                    // 水平方向のビット数
+                        // Unsafe を用いた Native メモリダイレクト判定
+                        for (int r = 0; r < duplicateFactor; r++) {
+                            long rowAddr = blockStartAddr + ((long) r * rowStride) + colOffset;
 
-        for (int i = 0; i < pixelsIterations; i++) {
-            int blockStartByte = i * duplicateFactor * rowStride;
+                            for (int c = 0; c < duplicateFactor; c++) {
+                                long pAddr = rowAddr + ((long) c * RGB_CHANNELS);
 
-            for (int b = 0; b < bitsPerRow; b++) {
-                int pixelSum = 0;
-                int colByte = b * duplicateFactor * RGB_CHANNELS;
+                                int rVal, gVal, bVal;
+                                if (isBGR) {
+                                    bVal = UNSAFE.getByte(pAddr) & 0xFF;
+                                    gVal = UNSAFE.getByte(pAddr + 1) & 0xFF;
+                                    rVal = UNSAFE.getByte(pAddr + 2) & 0xFF;
+                                } else {
+                                    rVal = UNSAFE.getByte(pAddr) & 0xFF;
+                                    gVal = UNSAFE.getByte(pAddr + 1) & 0xFF;
+                                    bVal = UNSAFE.getByte(pAddr + 2) & 0xFF;
+                                }
 
-                // duplicateFactor x duplicateFactor のピクセル正方形領域を直接集計
-                for (int r = 0; r < duplicateFactor; r++) {
-                    int rowByte = blockStartByte + (r * rowStride) + colByte;
+                                // BytesUtils.pixelToBit のインライン高速化 (0xFF000000 | (R<<16) | (G<<8) | B)
+                                int argb = 0xFF000000 | (rVal << 16) | (gVal << 8) | bVal;
+                                pixelSum += argb;
+                            }
+                        }
 
-                    for (int c = 0; c < duplicateFactor; c++) {
-                        int pixelAddr = rowByte + (c * RGB_CHANNELS);
+                        // ビット判定
+                        int bit = pixelSum > oneMinThreshold ? 0 : 1;
 
-                        if (frameType == AV_PIX_FMT_BGR24) {
-                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr + 2], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr]);
-                        } else {
-                            pixelSum += bytesUtils.pixelToBit(pixelsCache[pixelAddr], pixelsCache[pixelAddr + 1], pixelsCache[pixelAddr + 2]);
+                        currentByteVal = (currentByteVal << 1) | bit;
+                        if (++currentBitsCount == 8) {
+                            if (currentByteVal == 0) {
+                                zeroBytesCount++;
+                            } else {
+                                if (zeroBytesCount > 0) {
+                                    writeZeroBytesWithCount(zeroBytesCount, outputStream);
+                                    zeroBytesCount = 0;
+                                }
+                                outputStream.write(currentByteVal);
+                            }
+                            currentByteVal = 0;
+                            currentBitsCount = 0;
                         }
                     }
                 }
+                taskStatistics.poll();
+            }
 
-                // ビットの決定
-                int bit = bytesUtils.pixelToBit(pixelSum, duplicateFactor);
-
-                if (bit >= 0) {
-                    currentByteVal = (currentByteVal << 1) | bit;
-
-                    if (++currentBitsCount == 8) {
-                        appendByteToStream(currentByteVal, outputStream);
-                        currentByteVal = 0;
-                        currentBitsCount = 0;
+            // フラッシュ処理
+            if (currentBitsCount > 0) {
+                int finalByte = currentByteVal << (8 - currentBitsCount);
+                if (finalByte == 0) {
+                    zeroBytesCount++;
+                } else {
+                    if (zeroBytesCount > 0) {
+                        writeZeroBytesWithCount(zeroBytesCount, outputStream);
+                        zeroBytesCount = 0;
                     }
+                    outputStream.write(finalByte);
                 }
             }
-        }
-    }
+            if (zeroBytesCount > 0) {
+                writeZeroBytesWithCount(zeroBytesCount, outputStream);
+            }
+            return null;
+        });
 
-    private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
-        if (byteVal == 0) {
-            zeroBytesCount++;
-            return;
+        // ----------------------------------------------------
+        // 【Producer】スレッドA: M4 Media Engine によるHWデコード
+        // ----------------------------------------------------
+        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+            // Apple Silicon ハードウェアデコーダーを有効化
+            grabber.setOption("hwaccel", "videotoolbox");
+            grabber.setOption("threads", "auto");
+            grabber.start();
+
+            Frame frame;
+            while ((frame = grabber.grabImage()) != null) {
+                if (frame.image == null || frame.image.length == 0) continue;
+
+                ByteBuffer bb = (ByteBuffer) frame.image[0];
+                // Direct Buffer の Native アドレスを抽出 (Zero-Copy)
+                long nativeAddress = ((sun.nio.ch.DirectBuffer) bb).address();
+
+                FramePacket packet = new FramePacket(
+                        nativeAddress,
+                        frame.imageWidth,
+                        frame.imageHeight,
+                        grabber.getPixelFormat(),
+                        false
+                );
+
+                queue.put(packet); // キューが満杯ならスレッドAが自然待機（バックプレッシャー）
+            }
+
+            queue.put(FramePacket.POISON_PILL); // 終了シグナル
+            consumerFuture.get(); // 解析側スレッドの例外・終了を検知
+
+        } catch (Exception e) {
+            throw new IOException("Error during pipeline frame processing", e);
+        } finally {
+            consumerExecutor.shutdown();
         }
-        if (zeroBytesCount > 0) {
-            writeZeroBytesWithCount(zeroBytesCount, outputStream);
-            zeroBytesCount = 0;
-        }
-        outputStream.write(byteVal);
     }
 
     private void writeZeroBytesWithCount(long count, OutputStream outputStream) throws IOException {
@@ -175,6 +218,25 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             final int bytesToWrite = (int) Math.min(remaining, bufferLength);
             outputStream.write(bulkZeroBuffer, 0, bytesToWrite);
             remaining -= bytesToWrite;
+        }
+    }
+
+    // パイプライン伝送用軽量データ転送オブジェクト
+    private static class FramePacket {
+        static final FramePacket POISON_PILL = new FramePacket(0, 0, 0, 0, true);
+
+        final long nativeAddress;
+        final int imageWidth;
+        final int imageHeight;
+        final int pixelFormat;
+        final boolean isPoisonPill;
+
+        FramePacket(long nativeAddress, int imageWidth, int imageHeight, int pixelFormat, boolean isPoisonPill) {
+            this.nativeAddress = nativeAddress;
+            this.imageWidth = imageWidth;
+            this.imageHeight = imageHeight;
+            this.pixelFormat = pixelFormat;
+            this.isPoisonPill = isPoisonPill;
         }
     }
 }
