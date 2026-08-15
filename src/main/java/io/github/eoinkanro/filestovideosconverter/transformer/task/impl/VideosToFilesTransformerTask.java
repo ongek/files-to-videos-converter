@@ -82,16 +82,33 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     }
 
     private void processFile(File video, OutputStream outputStream) throws IOException {
-        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
-            grabber.setOption("threads", "auto");
-            grabber.start();
+    try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+        grabber.setOption("threads", "auto");
+        
+        // 1. まず動画のヘッダー情報（メタデータ）だけを先に読み込ませる
+        grabber.startUnstarted(); 
+        
+        // 2. Codec IDを判定して、M4メディアエンジンの適切なデコーダーを指定する
+        int codecId = grabber.getVideoCodec();
+        if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_H264) {
+            grabber.setVideoCodecName("h264_videotoolbox"); // H.264用のM4回路
+        } else if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_HEVC) {
+            grabber.setVideoCodecName("hevc_videotoolbox"); // HEVC用のM4回路
+        }
+        
+        // 3. ハードウェアアクセラレーション自体をOS（VideoToolbox）に指定
+        grabber.setOption("hwaccel", "videotoolbox");
+        
+        // 4. 本番のデコード処理を開始
+        grabber.start();
 
-            try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
-                filter.start();
-                processFile(grabber, filter, outputStream);
-            }
+        try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
+            filter.start();
+            processFile(grabber, filter, outputStream);
         }
     }
+}
+
 
     private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
         Frame frame;
