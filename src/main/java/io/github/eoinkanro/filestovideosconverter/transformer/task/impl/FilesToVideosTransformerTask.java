@@ -68,18 +68,13 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 final long vOffset = yPlaneSize + uvPlaneSize;
                 nativeFrameSegment.asSlice(uOffset, (long) uvPlaneSize * 2).fill((byte) 0x80);
 
-                // JavaCV Frame 設定
-                final ByteBuffer yBuffer = nativeFrameSegment.asSlice(0, yPlaneSize).asByteBuffer();
-                final ByteBuffer uBuffer = nativeFrameSegment.asSlice(uOffset, uvPlaneSize).asByteBuffer();
-                final ByteBuffer vBuffer = nativeFrameSegment.asSlice(vOffset, uvPlaneSize).asByteBuffer();
+                // 全体バッファを取得
+                final ByteBuffer yuvBuffer = nativeFrameSegment.asByteBuffer();
 
+                // JavaCV Frame 設定（配列ではなく Buffer 直接参照に修正）
                 final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 1);
-                reusableFrame.image[0] = yBuffer;
-                reusableFrame.image[1] = uBuffer;
-                reusableFrame.image[2] = vBuffer;
-                reusableFrame.imageStride[0] = imgWidth;
-                reusableFrame.imageStride[1] = imgWidth / 2;
-                reusableFrame.imageStride[2] = imgWidth / 2;
+                reusableFrame.image = yuvBuffer; // ここを修正 (JavaCV Frame仕様)
+                reusableFrame.imageStride = imgWidth;
 
                 // FFmpeg レコーダー設定
                 videoRecorder.setFormat("mp4");
