@@ -75,8 +75,8 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     private void processFile(File video, OutputStream outputStream) throws IOException {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+            // スレッド指定（CLI引数のスレッド数に合わせる場合は設定可）
             grabber.setOption("threads", "auto");
-            // YUV420P等、デコード後の生のフレームをそのまま取得
             grabber.start();
 
             Frame frame;
@@ -89,16 +89,25 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 int imgHeight = frame.imageHeight;
                 int yPlaneSize = imgWidth * imgHeight;
 
-                // キャッシュバッファ確保
                 if (yPlaneCache.length < yPlaneSize) {
                     yPlaneCache = new byte[yPlaneSize];
                 }
 
-                // Yプレーン（輝度）のみをダイレクト抽出
                 ByteBuffer yBuffer = (ByteBuffer) frame.image[0];
-                yBuffer.get(yPlaneCache, 0, yPlaneSize);
+                int stride = frame.imageStride; // 行のパディング幅を取得
 
-                // 解読ルーチン実行
+                // FFmpegのストライド（1行あたりのバイト数）を考慮して1行ずつ安全に抽出
+                if (stride == imgWidth) {
+                    yBuffer.rewind();
+                    yBuffer.get(yPlaneCache, 0, yPlaneSize);
+                } else {
+                    for (int r = 0; r < imgHeight; r++) {
+                        yBuffer.position(r * stride);
+                        yBuffer.get(yPlaneCache, r * imgWidth, imgWidth);
+                    }
+                }
+
+                // 高速解読ルーチン実行
                 processYPlane(yPlaneCache, imgWidth, imgHeight, outputStream);
 
                 taskStatistics.poll();
@@ -129,25 +138,24 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 }
             }
         } 
-        // --- SLOW PATH: duplicateFactor > 1 ---
+        // --- SLOW PATH: duplicateFactor > 1 (ブロック判定) ---
         else {
-            final int blockRowStride = df * width;
             final int bitsPerRow = width / df;
-            final int rows = height / df;
-            final int threshold = (df * df * 255) / 2; // 判定しきい値
+            final int blockRows = height / df;
+            final int threshold = (df * df * 255) / 2; // 輝度の合計しきい値 (白黒判定用)
 
-            for (int r = 0; r < rows; r++) {
-                final int blockStart = r * blockRowStride;
+            for (int r = 0; r < blockRows; r++) {
+                final int rowStart = r * df * width;
 
                 for (int b = 0; b < bitsPerRow; b++) {
                     final int colStart = b * df;
                     int ySum = 0;
 
-                    // ブロック内の輝度合計を計算
+                    // df x df ブロック内の輝度合計を計算
                     for (int dr = 0; dr < df; dr++) {
-                        int rowOffset = blockStart + (dr * width) + colStart;
+                        int currentLineOffset = rowStart + (dr * width) + colStart;
                         for (int dc = 0; dc < df; dc++) {
-                            ySum += (yPlane[rowOffset + dc] & 0xFF);
+                            ySum += (yPlane[currentLineOffset + dc] & 0xFF);
                         }
                     }
 
