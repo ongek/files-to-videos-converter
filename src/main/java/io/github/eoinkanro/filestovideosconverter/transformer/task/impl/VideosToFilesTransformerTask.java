@@ -19,14 +19,12 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
     private static final int OUTPUT_BUFFER_SIZE = 128 * 1024;
-    private static final long CACHE_LINE_SIZE = 128;
     
-    // 32画素 (2^5) = 96 Bytes。128Bキャッシュライン内に完全収容
-    private static final int SIMD_PIXELS_BATCH = 32; 
-    private static final int SIMD_BYTES_BATCH = SIMD_PIXELS_BATCH * RGB_CHANNELS; // 96 Bytes
+    private static final int UNROLL_PIXELS = 32;
+    private static final int UNROLL_BYTES = UNROLL_PIXELS * RGB_CHANNELS; // 96 Bytes
 
     private final byte[] bulkZeroBuffer = new byte[16384];
-    private final int[] extractedBitsBuffer = new int[SIMD_PIXELS_BATCH];
+    private final int[] extractedBitsBuffer = new int[UNROLL_PIXELS];
 
     private int duplicateFactor;
     private int imageWidth;
@@ -107,102 +105,68 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 continue;
             }
 
-            // JavaCV Frame APIの正確なストライド判定
-            // FFmpegレイヤで必ず正の値が設定されるため、0以下は異常フレームとして即座に弾く
             int rowStride = frame.imageStride;
-            if (rowStride <= 0) {
-                throw new IllegalStateException("Invalid imageStride from FFmpeg frame: " + rowStride);
-            }
-
-            int totalBytesLength = frame.imageHeight * rowStride;
-
             ByteBuffer nativeBuffer = (ByteBuffer) frame.image[0];
             MemorySegment segment = MemorySegment.ofBuffer(nativeBuffer);
 
-            processImageLimitFFM(segment, totalBytesLength, rowStride, outputStream);
+            processImageLimitFFM(segment, frame.imageHeight, rowStride, outputStream);
 
             taskStatistics.poll();
         }
     }
 
-    /**
-     * 128B Align-Up ＆ 分岐・I/O排除型パイプライン処理メソッド
-     */
-    private void processImageLimitFFM(MemorySegment segment, int totalBytesLength, int rowStride, OutputStream outputStream) throws IOException {
+    private void processImageLimitFFM(MemorySegment segment, int imageHeight, int rowStride, OutputStream outputStream) throws IOException {
         final int df = duplicateFactor;
+        final int width = imageWidth;
 
-        // =========================================================================
-        // FAST PATH: duplicateFactor == 1
-        // =========================================================================
+        // FAST PATH: Row-based Cache-Aligned Iteration (df == 1)
         if (df == 1) {
-            long addr = 0;
-            long rawAddress = segment.address();
+            final int activeRowBytes = width * RGB_CHANNELS;
+            final int unrollLimitBytes = activeRowBytes - (activeRowBytes % UNROLL_BYTES);
 
-            // 1. [HEAD] 128B境界に達する以上の最小画素数（3バイト単位）まで繰り上げてAlign-Up
-            long offsetToAlignment = (CACHE_LINE_SIZE - (rawAddress % CACHE_LINE_SIZE)) % CACHE_LINE_SIZE;
-            long headBytes = 0;
-            if (offsetToAlignment > 0) {
-                headBytes = ((offsetToAlignment + (RGB_CHANNELS - 1)) / RGB_CHANNELS) * RGB_CHANNELS;
-                headBytes = Math.min(totalBytesLength, headBytes);
-            }
+            for (int y = 0; y < imageHeight; y++) {
+                final long rowBaseAddr = (long) y * rowStride;
+                long addr = rowBaseAddr;
+                final long unrollEndAddr = rowBaseAddr + unrollLimitBytes;
 
-            // HEADスカラ処理
-            for (; addr < headBytes; addr += RGB_CHANNELS) {
-                byte r = segment.get(ValueLayout.JAVA_BYTE, addr);
-                byte g = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
-                byte b = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
+                for (; addr < unrollEndAddr; addr += UNROLL_BYTES) {
+                    for (int p = 0; p < UNROLL_PIXELS; p++) {
+                        long pxAddr = addr + (p * RGB_CHANNELS);
+                        byte r = segment.get(ValueLayout.JAVA_BYTE, pxAddr);
+                        byte g = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 1);
+                        byte b = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 2);
 
-                int pBit = bytesUtils.pixelToBit(r, g, b);
-                int bit = bytesUtils.pixelToBit(pBit, 1);
-                processSingleBit(bit, outputStream);
-            }
+                        int pBit = bytesUtils.pixelToBit(r, g, b);
+                        extractedBitsBuffer[p] = bytesUtils.pixelToBit(pBit, 1);
+                    }
 
-            // 2. [ALIGNED BODY] 128B境界以降での超高速ループ（分岐・I/O排除）
-            long remainingBytes = totalBytesLength - addr;
-            long bodyEnd = addr + (remainingBytes - (remainingBytes % SIMD_BYTES_BATCH));
+                    for (int p = 0; p < UNROLL_PIXELS; p++) {
+                        processSingleBit(extractedBitsBuffer[p], outputStream);
+                    }
+                }
 
-            for (; addr < bodyEnd; addr += SIMD_BYTES_BATCH) {
-                // インナーループ内では配列への抽出のみ（分岐・I/Oを完全排除）
-                for (int p = 0; p < SIMD_PIXELS_BATCH; p++) {
-                    long pxAddr = addr + (p * RGB_CHANNELS);
-                    byte r = segment.get(ValueLayout.JAVA_BYTE, pxAddr);
-                    byte g = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 1);
-                    byte b = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 2);
+                final long activeEndAddr = rowBaseAddr + activeRowBytes;
+                for (; addr < activeEndAddr; addr += RGB_CHANNELS) {
+                    byte r = segment.get(ValueLayout.JAVA_BYTE, addr);
+                    byte g = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
+                    byte b = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
 
                     int pBit = bytesUtils.pixelToBit(r, g, b);
-                    extractedBitsBuffer[p] = bytesUtils.pixelToBit(pBit, 1);
-                }
-
-                // 抽出し終わったビットバッファを一括処理
-                for (int p = 0; p < SIMD_PIXELS_BATCH; p++) {
-                    processSingleBit(extractedBitsBuffer[p], outputStream);
+                    int bit = bytesUtils.pixelToBit(pBit, 1);
+                    processSingleBit(bit, outputStream);
                 }
             }
-
-            // 3. [TAIL] 端数処理
-            for (; addr < totalBytesLength; addr += RGB_CHANNELS) {
-                byte r = segment.get(ValueLayout.JAVA_BYTE, addr);
-                byte g = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
-                byte b = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
-
-                int pBit = bytesUtils.pixelToBit(r, g, b);
-                int bit = bytesUtils.pixelToBit(pBit, 1);
-                processSingleBit(bit, outputStream);
-            }
-
             return;
         }
 
-        // =========================================================================
-        // SLOW PATH: duplicateFactor > 1 (JavaCV imageStrideパディング対応)
-        // =========================================================================
-        final int pixelsIterations = (totalBytesLength / rowStride) / df;
-        final int bitsPerRow = imageWidth / df;
+        // SLOW PATH: Block-based Iteration (df > 1)
+        final int blockRows = imageHeight / df;
+        final int bitsPerRow = width / df;
 
         final int colByteStride = df * RGB_CHANNELS;
         final int blockRowStride = df * rowStride;
 
-        for (int i = 0; i < pixelsIterations; i++) {
+        for (int i = 0; i < blockRows; i++) {
             final long blockStartByte = (long) i * blockRowStride;
 
             for (int b = 0; b < bitsPerRow; b++) {
