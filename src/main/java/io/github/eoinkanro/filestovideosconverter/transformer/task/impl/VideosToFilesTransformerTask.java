@@ -84,20 +84,21 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     private void processFile(File video, OutputStream outputStream) throws IOException {
     try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
         
-        // 【決定打】JavaCVネイティブAPIでVideoToolbox(HWDevice)を明示指定
-        grabber.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_NV12); // HWの素の出力フォーマット
-        grabber.setVideoHWAccel("videotoolbox"); // 汎用optionではなく専用メソッドを使う
+        // 1. HWデコーダのネイティブ出力フォーマット(NV12)を指定
+        grabber.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_NV12);
+        
+        // 2. 正しいJavaCV APIでVideoToolboxを指定
+        grabber.setVideoOption("hwaccel", "videotoolbox");
 
         grabber.start();
 
-        // FFmpegFrameFilterでNV12 -> RGB24へ変換（Filter側でM4のNEON最適化swscaleを効かせる）
+        // 3. Filterで NV12 -> RGB24 へ変換
         try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
             filter.start();
             processFile(grabber, filter, outputStream);
         }
     }
 }
-
 
     private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
         Frame frame;
