@@ -8,29 +8,27 @@ import org.bytedeco.javacv.FFmpegFrameGrabber;
 import org.bytedeco.javacv.Frame;
 
 import java.io.*;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.VIDEOS_PATH;
-import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_BGR24;
 
 @Log4j2
 public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
+    // M4のL2/L3キャッシュサイズに合わせた128KB出力バッファ
+    private static final int OUTPUT_BUFFER_SIZE = 128 * 1024;
 
-    // === ゼロアロケーション用キャッシュバッファ ===
     private final byte[] bulkZeroBuffer = new byte[16384];
-    private byte[] pixelsCache = new byte[0];
 
     private int duplicateFactor;
     private int imageWidth;
 
-    // ビットストリーム・状態管理用
     private int currentBitsCount;
     private int currentByteVal;
     private long zeroBytesCount;
-
-    private int frameType;
 
     public VideosToFilesTransformerTask(File processData) {
         super(processData);
@@ -49,18 +47,15 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
-        // 64KBバッファで I/O コストを削減
-        try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), 65536)) {
+        try (OutputStream outputStream = new BufferedOutputStream(new FileOutputStream(resultFile), OUTPUT_BUFFER_SIZE)) {
             duplicateFactor = fileUtils.getImageDuplicateFactor(processData.getAbsolutePath());
 
-            // 状態初期化
             currentBitsCount = 0;
             currentByteVal = 0;
             zeroBytesCount = 0;
 
             processFile(processData, outputStream);
 
-            // 残った端数ビットの処理
             if (currentBitsCount > 0) {
                 currentByteVal <<= (8 - currentBitsCount);
                 appendByteToStream(currentByteVal, outputStream);
@@ -68,7 +63,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 currentBitsCount = 0;
             }
 
-            // 元ファイルに存在していた末尾ゼロ（-zXXで記録された分）のみ復元
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
@@ -88,8 +82,8 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
             grabber.setOption("threads", "auto");
             grabber.start();
-            frameType = grabber.getPixelFormat();
 
+            // フィルター出力は RGB24 に固定される
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
                 filter.start();
                 processFile(grabber, filter, outputStream);
@@ -110,44 +104,39 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             }
 
             int requiredPixelsLength = frame.imageHeight * frame.imageWidth * RGB_CHANNELS;
-            if (pixelsCache.length < requiredPixelsLength) {
-                pixelsCache = new byte[requiredPixelsLength];
-            }
-            ((ByteBuffer) frame.image[0]).get(pixelsCache, 0, requiredPixelsLength);
 
-            processImageLimit(requiredPixelsLength, outputStream);
+            // ネイティブメモリ(DirectByteBuffer)からヒープへの転送を行わず、FFM MemorySegment でラップ
+            ByteBuffer nativeBuffer = (ByteBuffer) frame.image[0];
+            MemorySegment segment = MemorySegment.ofBuffer(nativeBuffer);
+
+            processImageLimitFFM(segment, requiredPixelsLength, outputStream);
 
             taskStatistics.poll();
         }
     }
 
     /**
-     * duplicateFactorの分岐を備えた最高速度処理ロジック
+     * Java FFM (Foreign Function & Memory) API によるゼロコピー直読処理
      */
-    private void processImageLimit(int pixelsLength, OutputStream outputStream) throws IOException {
+    private void processImageLimitFFM(MemorySegment segment, int pixelsLength, OutputStream outputStream) throws IOException {
         final int df = duplicateFactor;
-
-        // カラーフォーマットに応じたチャンネルオフセット
-        final int rOffset = (frameType == AV_PIX_FMT_BGR24) ? 2 : 0;
-        final int gOffset = 1;
-        final int bOffset = (frameType == AV_PIX_FMT_BGR24) ? 0 : 2;
 
         int bitCount = this.currentBitsCount;
         int byteVal = this.currentByteVal;
 
         // =========================================================================
-        // FAST PATH: duplicateFactor == 1 (ブロック計算を全スキップし、1次元リニアスキャン)
+        // FAST PATH: duplicateFactor == 1 (1次元リニアスキャン)
         // =========================================================================
         if (df == 1) {
-            final byte[] cache = pixelsCache;
-            for (int addr = 0; addr < pixelsLength; addr += RGB_CHANNELS) {
-                int pBit = bytesUtils.pixelToBit(
-                        cache[addr + rOffset],
-                        cache[addr + gOffset],
-                        cache[addr + bOffset]
-                );
+            for (long addr = 0; addr < pixelsLength; addr += RGB_CHANNELS) {
+                // フィルター通過後につき常に R=0, G=1, B=2 で固定
+                byte r = segment.get(ValueLayout.JAVA_BYTE, addr);
+                byte g = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
+                byte b = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
 
+                int pBit = bytesUtils.pixelToBit(r, g, b);
                 int bit = bytesUtils.pixelToBit(pBit, 1);
+
                 if (bit >= 0) {
                     byteVal = (byteVal << 1) | bit;
 
@@ -165,7 +154,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         }
 
         // =========================================================================
-        // SLOW PATH: duplicateFactor > 1 (加算のみのポインタ的走査)
+        // SLOW PATH: duplicateFactor > 1 (ブロック走査)
         // =========================================================================
         final int rowStride = imageWidth * RGB_CHANNELS;
         final int pixelsIterations = pixelsLength / rowStride / df;
@@ -173,24 +162,23 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
         final int colByteStride = df * RGB_CHANNELS;
         final int blockRowStride = df * rowStride;
-        final byte[] cache = pixelsCache;
 
         for (int i = 0; i < pixelsIterations; i++) {
-            final int blockStartByte = i * blockRowStride;
+            final long blockStartByte = (long) i * blockRowStride;
 
             for (int b = 0; b < bitsPerRow; b++) {
-                final int colByte = b * colByteStride;
+                final long colByte = (long) b * colByteStride;
                 int pixelSum = 0;
 
-                int rowAddr = blockStartByte + colByte;
+                long rowAddr = blockStartByte + colByte;
                 for (int r = 0; r < df; r++) {
-                    int addr = rowAddr;
+                    long addr = rowAddr;
                     for (int c = 0; c < df; c++) {
-                        pixelSum += bytesUtils.pixelToBit(
-                                cache[addr + rOffset],
-                                cache[addr + gOffset],
-                                cache[addr + bOffset]
-                        );
+                        byte red = segment.get(ValueLayout.JAVA_BYTE, addr);
+                        byte green = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
+                        byte blue = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
+
+                        pixelSum += bytesUtils.pixelToBit(red, green, blue);
                         addr += RGB_CHANNELS;
                     }
                     rowAddr += rowStride;
@@ -214,9 +202,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         this.currentByteVal = byteVal;
     }
 
-    /**
-     * ゼロバイト遅延書き込み処理
-     */
     private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
         if (byteVal == 0) {
             zeroBytesCount++;
