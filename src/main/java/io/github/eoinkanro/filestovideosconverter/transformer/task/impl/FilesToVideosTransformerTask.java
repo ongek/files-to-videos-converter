@@ -12,6 +12,7 @@ import java.io.FileInputStream;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
@@ -45,7 +46,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
         final int yPlaneSize = imgWidth * imgHeight;
         final int uvPlaneSize = (imgWidth / 2) * (imgHeight / 2);
-        final int frameSizeYuv = yPlaneSize + (uvPlaneSize * 2); // YUV420P トータルバイト数
+        final int frameSizeYuv = yPlaneSize + (uvPlaneSize * 2);
 
         final int localTempRowLength = imgWidth / duplicateFactor;
         final byte[] localTempRow = new byte[localTempRowLength];
@@ -60,7 +61,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                  BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData), IO_BUFFER_SIZE);
                  FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(resultVideoFile, imgWidth, imgHeight)) {
 
-                // YUV420Pフレーム全体のネイティブメモリを確保 (64バイトアライメント)
+                // YUV420Pフレーム全体のネイティブメモリを確保 (64バイトアライメント = L2/L3キャッシュライン最適化)
                 final MemorySegment nativeFrameSegment = arena.allocate((long) frameSizeYuv, 64);
                 
                 // 色度(U/V)プレーンを固定値 128 (0x80 = 完全無色/モノクロ) で事前に初期化
@@ -68,13 +69,15 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 final long vOffset = yPlaneSize + uvPlaneSize;
                 nativeFrameSegment.asSlice(uOffset, (long) uvPlaneSize * 2).fill((byte) 0x80);
 
-                // 全体バッファを取得
-                final ByteBuffer yuvBuffer = nativeFrameSegment.asByteBuffer();
+                // 各プレーンの ByteBuffer を生成
+                final ByteBuffer yBuffer = nativeFrameSegment.asSlice(0, yPlaneSize).asByteBuffer();
+                final ByteBuffer uBuffer = nativeFrameSegment.asSlice(uOffset, uvPlaneSize).asByteBuffer();
+                final ByteBuffer vBuffer = nativeFrameSegment.asSlice(vOffset, uvPlaneSize).asByteBuffer();
 
-                // JavaCV Frame 設定（配列ではなく Buffer 直接参照に修正）
+                // JavaCV Frame 設定 (配列として代入)
                 final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 1);
-                reusableFrame.image = yuvBuffer; // ここを修正 (JavaCV Frame仕様)
-                reusableFrame.imageStride = imgWidth;
+                reusableFrame.image = new Buffer[] { yBuffer, uBuffer, vBuffer };
+                reusableFrame.imageStride = new int[] { imgWidth, imgWidth / 2, imgWidth / 2 };
 
                 // FFmpeg レコーダー設定
                 videoRecorder.setFormat("mp4");
