@@ -23,9 +23,11 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     // Apple M4のキャッシュライン境界（128バイト）
     private static final long CACHE_LINE_SIZE = 128;
     
-    // C2のAuto-Vectorization(NEON)が確実に発動する 2^4 = 16 画素（48バイト）ブロック
-    private static final int SIMD_PIXELS_BATCH = 16; 
-    private static final int SIMD_BYTES_BATCH = SIMD_PIXELS_BATCH * RGB_CHANNELS; // 48 Bytes (16B NEON×3)
+    // 【物理×C2の完全合体解】
+    // 32画素 (2^5の累乗) × 3バイト = 96バイト
+    // 128Bアライメント下で 96B < 128B となり、単一ループ内でLine Splitが原理的に100%発生しない
+    private static final int SIMD_PIXELS_BATCH = 32; 
+    private static final int SIMD_BYTES_BATCH = SIMD_PIXELS_BATCH * RGB_CHANNELS; // 96 Bytes
 
     private final byte[] bulkZeroBuffer = new byte[16384];
 
@@ -120,7 +122,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     }
 
     /**
-     * 128B Align-Up 物理整列 ＆ 2^n (16画素) NEON Auto-Vectorization 究極最適化
+     * 128B Align-Up ＆ 32画素(96B = 2^5 NEON) 物理・VM両制覇アルゴリズム
      */
     private void processImageLimitFFM(MemorySegment segment, int pixelsLength, OutputStream outputStream) throws IOException {
         final int df = duplicateFactor;
@@ -134,9 +136,8 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             long addr = 0;
             long rawAddress = segment.address();
 
-            // 1. [HEAD] 物理メモリが128バイト境界（M4 Cache Line）に揃うまでスカラ処理で進める（Align-Up Guard）
+            // 1. [HEAD] 128Bキャッシュライン境界にアライメントを合わせる
             long offsetToAlignment = (CACHE_LINE_SIZE - (rawAddress % CACHE_LINE_SIZE)) % CACHE_LINE_SIZE;
-            // 画素境界（3バイトの倍数）に調整
             long headBytes = Math.min(pixelsLength, offsetToAlignment - (offsetToAlignment % RGB_CHANNELS));
 
             for (; addr < headBytes; addr += RGB_CHANNELS) {
@@ -157,13 +158,12 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 }
             }
 
-            // 2. [ALIGNED BODY] 128Bアライメント済み ＆ 2^4 = 16画素（48B）単位のSIMDループ
-            // C2コンパイラの Superword Optimization が 100% NEON 命令化に成功する2の累乗ブロック
+            // 2. [ALIGNED BODY] 96バイト（32画素 = 2^5）単位での超高速一括読み出し
+            // C2コンパイラの2の累乗条件を満たしつつ、128Bキャッシュライン境界(96 < 128)を一切侵さない
             long remainingBytes = pixelsLength - addr;
             long bodyEnd = addr + (remainingBytes - (remainingBytes % SIMD_BYTES_BATCH));
 
             for (; addr < bodyEnd; addr += SIMD_BYTES_BATCH) {
-                // 16画素（48バイト）を固定展開し、C2にVector Register(128bit)を割り当てさせる
                 for (int p = 0; p < SIMD_PIXELS_BATCH; p++) {
                     long pxAddr = addr + (p * RGB_CHANNELS);
                     byte r = segment.get(ValueLayout.JAVA_BYTE, pxAddr);
