@@ -29,6 +29,22 @@ public class FilesToVideosTransformerTask extends TransformerTask {
     private static final byte Y_ONE = (byte) 0x00; // 黒
     private static final byte Y_ZERO = (byte) 0xFF; // 白
 
+    // M4 L1キャッシュに常駐させる LUT (Look-Up Table): 256通りの1バイトを8バイトのY輝度列へ超高速変換
+    private static final byte[][] BYTE_TO_Y8_LUT = new byte[256][8];
+
+    static {
+        for (int i = 0; i < 256; i++) {
+            BYTE_TO_Y8_LUT[i][0] = ((i & 0x80) != 0) ? Y_ONE : Y_ZERO;
+            BYTE_TO_Y8_LUT[i][1] = ((i & 0x40) != 0) ? Y_ONE : Y_ZERO;
+            BYTE_TO_Y8_LUT[i][2] = ((i & 0x20) != 0) ? Y_ONE : Y_ZERO;
+            BYTE_TO_Y8_LUT[i][3] = ((i & 0x10) != 0) ? Y_ONE : Y_ZERO;
+            BYTE_TO_Y8_LUT[i][4] = ((i & 0x08) != 0) ? Y_ONE : Y_ZERO;
+            BYTE_TO_Y8_LUT[i][5] = ((i & 0x04) != 0) ? Y_ONE : Y_ZERO;
+            BYTE_TO_Y8_LUT[i][6] = ((i & 0x02) != 0) ? Y_ONE : Y_ZERO;
+            BYTE_TO_Y8_LUT[i][7] = ((i & 0x01) != 0) ? Y_ONE : Y_ZERO;
+        }
+    }
+
     public FilesToVideosTransformerTask(File processData) {
         super(processData);
     }
@@ -61,7 +77,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                  BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData), IO_BUFFER_SIZE);
                  FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(resultVideoFile, imgWidth, imgHeight)) {
 
-                // YUV420Pフレーム全体のネイティブメモリを確保 (64バイトアライメント = L2/L3キャッシュライン最適化)
+                // YUV420Pフレーム全体のネイティブメモリを確保 (64バイトアライメント)
                 final MemorySegment nativeFrameSegment = arena.allocate((long) frameSizeYuv, 64);
                 
                 // 色度(U/V)プレーンを固定値 128 (0x80 = 完全無色/モノクロ) で事前に初期化
@@ -74,10 +90,10 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 final ByteBuffer uBuffer = nativeFrameSegment.asSlice(uOffset, uvPlaneSize).asByteBuffer();
                 final ByteBuffer vBuffer = nativeFrameSegment.asSlice(vOffset, uvPlaneSize).asByteBuffer();
 
-                // JavaCV Frame 設定 (配列として代入)
+                // JavaCV Frame 設定
                 final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 1);
                 reusableFrame.image = new Buffer[] { yBuffer, uBuffer, vBuffer };
-                reusableFrame.imageStride = new int[] { imgWidth, imgWidth / 2, imgWidth / 2 };
+                reusableFrame.imageStride = imgWidth; // int 型に修正
 
                 // FFmpeg レコーダー設定
                 videoRecorder.setFormat("mp4");
@@ -108,15 +124,9 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                     for (int i = 0; i < bytesRead; i++) {
                         final int aByte = readBuffer[i] & 0xFF;
 
-                        // byte配列（Y輝度値）に直接展開
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x80) != 0) ? Y_ONE : Y_ZERO;
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x40) != 0) ? Y_ONE : Y_ZERO;
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x20) != 0) ? Y_ONE : Y_ZERO;
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x10) != 0) ? Y_ONE : Y_ZERO;
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x08) != 0) ? Y_ONE : Y_ZERO;
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x04) != 0) ? Y_ONE : Y_ZERO;
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x02) != 0) ? Y_ONE : Y_ZERO;
-                        localTempRow[localTempRowIndex++] = ((aByte & 0x01) != 0) ? Y_ONE : Y_ZERO;
+                        // LUT (Look-Up Table) 参照による一括コピー (M4 L1キャッシュ最適化)
+                        System.arraycopy(BYTE_TO_Y8_LUT[aByte], 0, localTempRow, localTempRowIndex, 8);
+                        localTempRowIndex += 8;
 
                         if (localTempRowIndex >= localTempRowLength) {
                             currentPixelIndex = flushRowToNativeMemory(
@@ -172,7 +182,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 currentPixelIndex = 0;
             }
 
-            // SIMD最適化バルクメモリコピー (JAVA_BYTE)
+            // SIMD/NEON最適化バルクメモリコピー
             MemorySegment.copy(localTempRow, 0, nativeFrameSegment, ValueLayout.JAVA_BYTE, currentPixelIndex, localTempRowLength);
             return currentPixelIndex + localTempRowLength;
         }
