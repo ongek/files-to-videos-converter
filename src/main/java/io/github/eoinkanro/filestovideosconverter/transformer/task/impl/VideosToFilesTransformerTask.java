@@ -21,12 +21,11 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     private static final int OUTPUT_BUFFER_SIZE = 128 * 1024;
     private static final long CACHE_LINE_SIZE = 128;
     
-    // 32画素 (2^5) = 96 Bytes。SIMDベクトル化に特化
+    // 32画素 (2^5) = 96 Bytes。128Bキャッシュライン内に完全収容
     private static final int SIMD_PIXELS_BATCH = 32; 
     private static final int SIMD_BYTES_BATCH = SIMD_PIXELS_BATCH * RGB_CHANNELS; // 96 Bytes
 
     private final byte[] bulkZeroBuffer = new byte[16384];
-    // SIMD抽出用のローカルビットバッファ（インナーループ内でのI/O・分岐排除用）
     private final int[] extractedBitsBuffer = new int[SIMD_PIXELS_BATCH];
 
     private int duplicateFactor;
@@ -108,21 +107,26 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 continue;
             }
 
-            // FFmpegのストライド（linesize[0]）を取得。パディングに対応
-            int rowStride = frame.linesize[0] > 0 ? frame.linesize[0] : frame.imageWidth * RGB_CHANNELS;
-            int requiredPixelsLength = frame.imageHeight * rowStride;
+            // JavaCV Frame APIの正確なストライド判定
+            // FFmpegレイヤで必ず正の値が設定されるため、0以下は異常フレームとして即座に弾く
+            int rowStride = frame.imageStride;
+            if (rowStride <= 0) {
+                throw new IllegalStateException("Invalid imageStride from FFmpeg frame: " + rowStride);
+            }
+
+            int totalBytesLength = frame.imageHeight * rowStride;
 
             ByteBuffer nativeBuffer = (ByteBuffer) frame.image[0];
             MemorySegment segment = MemorySegment.ofBuffer(nativeBuffer);
 
-            processImageLimitFFM(segment, requiredPixelsLength, rowStride, outputStream);
+            processImageLimitFFM(segment, totalBytesLength, rowStride, outputStream);
 
             taskStatistics.poll();
         }
     }
 
     /**
-     * 分岐・I/Oをインナーループから完全に排除し、正しく128B Align-UpされたC2 SIMD完全適合版
+     * 128B Align-Up ＆ 分岐・I/O排除型パイプライン処理メソッド
      */
     private void processImageLimitFFM(MemorySegment segment, int totalBytesLength, int rowStride, OutputStream outputStream) throws IOException {
         final int df = duplicateFactor;
@@ -138,7 +142,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             long offsetToAlignment = (CACHE_LINE_SIZE - (rawAddress % CACHE_LINE_SIZE)) % CACHE_LINE_SIZE;
             long headBytes = 0;
             if (offsetToAlignment > 0) {
-                // 128B境界を超えるために必要な3バイト(画素)単位のバイト数
                 headBytes = ((offsetToAlignment + (RGB_CHANNELS - 1)) / RGB_CHANNELS) * RGB_CHANNELS;
                 headBytes = Math.min(totalBytesLength, headBytes);
             }
@@ -154,14 +157,12 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 processSingleBit(bit, outputStream);
             }
 
-            // 2. [ALIGNED BODY] 128B境界以降で動く純粋SIMD対象ループ
-            // 分岐(if)もI/O呼び出しも一切排除し、配列への純粋計算のみを行うことでC2のAuto-Vectorizationを100%発動させる
+            // 2. [ALIGNED BODY] 128B境界以降での超高速ループ（分岐・I/O排除）
             long remainingBytes = totalBytesLength - addr;
             long bodyEnd = addr + (remainingBytes - (remainingBytes % SIMD_BYTES_BATCH));
 
             for (; addr < bodyEnd; addr += SIMD_BYTES_BATCH) {
-                // --- 【C2 Auto-Vectorization 対象ブロック】 ---
-                // 分岐なし・外部呼び出しなし・定数回数(32)・2の累乗
+                // インナーループ内では配列への抽出のみ（分岐・I/Oを完全排除）
                 for (int p = 0; p < SIMD_PIXELS_BATCH; p++) {
                     long pxAddr = addr + (p * RGB_CHANNELS);
                     byte r = segment.get(ValueLayout.JAVA_BYTE, pxAddr);
@@ -169,12 +170,10 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                     byte b = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 2);
 
                     int pBit = bytesUtils.pixelToBit(r, g, b);
-                    // 結果をローカル配列に直接代入（分岐・I/O排除）
                     extractedBitsBuffer[p] = bytesUtils.pixelToBit(pBit, 1);
                 }
 
-                // --- 【Post-Processing Block (SIMD外処理)】 ---
-                // 抽出し終わったビットバッファを一括でストリームへ詰める
+                // 抽出し終わったビットバッファを一括処理
                 for (int p = 0; p < SIMD_PIXELS_BATCH; p++) {
                     processSingleBit(extractedBitsBuffer[p], outputStream);
                 }
@@ -195,9 +194,8 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         }
 
         // =========================================================================
-        // SLOW PATH: duplicateFactor > 1 (linesizeパディング対応版)
+        // SLOW PATH: duplicateFactor > 1 (JavaCV imageStrideパディング対応)
         // =========================================================================
-        final int activeRowBytes = imageWidth * RGB_CHANNELS;
         final int pixelsIterations = (totalBytesLength / rowStride) / df;
         final int bitsPerRow = imageWidth / df;
 
@@ -222,7 +220,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                         pixelSum += bytesUtils.pixelToBit(red, green, blue);
                         addr += RGB_CHANNELS;
                     }
-                    rowAddr += rowStride; // パディングを含んだ正確な行ストライドで加算
+                    rowAddr += rowStride;
                 }
 
                 int bit = bytesUtils.pixelToBit(pixelSum, df);
@@ -231,9 +229,6 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         }
     }
 
-    /**
-     * ビット連結およびOutputStreamへの書き出し（I/O）共通処理
-     */
     private void processSingleBit(int bit, OutputStream outputStream) throws IOException {
         if (bit >= 0) {
             currentByteVal = (currentByteVal << 1) | bit;
