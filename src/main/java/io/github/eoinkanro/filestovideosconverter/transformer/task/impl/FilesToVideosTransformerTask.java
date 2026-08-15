@@ -9,14 +9,16 @@ import org.bytedeco.javacv.Frame;
 import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.*;
+import static io.github.eoinkanro.filestovideosconverter.utils.BytesUtils.ZERO;
+import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGBA;
 import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P;
 
 @Log4j2
@@ -24,25 +26,10 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
     private static final int IO_BUFFER_SIZE = 1024 * 1024;
     private static final int READ_CHUNK_SIZE = 65536; // 64KB ディスク一括バッファ
+    private static final long M4_CACHE_LINE_ALIGNMENT = 128L; // Apple M4 L1D/L2/SLC キャッシュライン (128 bytes)
 
-    // YUV420p 用の輝度(Y)値: 白 = 255 (0xFF), 黒 = 0 (0x00)
-    private static final byte Y_ONE = (byte) 0x00; // 黒
-    private static final byte Y_ZERO = (byte) 0xFF; // 白
-
-    // M4 L1キャッシュに常駐させる LUT (Look-Up Table): 256通りの1バイトを8バイトのY輝度列へ超高速変換
-    private static final byte[][] BYTE_TO_Y8_LUT = new byte[256][8];
-
-    static {
-        for (int i = 0; i < 256; i++) {
-            BYTE_TO_Y8_LUT[i][0] = ((i & 0x80) != 0) ? Y_ONE : Y_ZERO;
-            BYTE_TO_Y8_LUT[i][1] = ((i & 0x40) != 0) ? Y_ONE : Y_ZERO;
-            BYTE_TO_Y8_LUT[i][2] = ((i & 0x20) != 0) ? Y_ONE : Y_ZERO;
-            BYTE_TO_Y8_LUT[i][3] = ((i & 0x10) != 0) ? Y_ONE : Y_ZERO;
-            BYTE_TO_Y8_LUT[i][4] = ((i & 0x08) != 0) ? Y_ONE : Y_ZERO;
-            BYTE_TO_Y8_LUT[i][5] = ((i & 0x04) != 0) ? Y_ONE : Y_ZERO;
-            BYTE_TO_Y8_LUT[i][6] = ((i & 0x02) != 0) ? Y_ONE : Y_ZERO;
-            BYTE_TO_Y8_LUT[i][7] = ((i & 0x01) != 0) ? Y_ONE : Y_ZERO;
-        }
+    private static final class EncoderContext {
+        int currentPixelIndex = 0;
     }
 
     public FilesToVideosTransformerTask(File processData) {
@@ -56,56 +43,43 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         final int localLastZeroBytesCount = fileUtils.calculateLastZeroBytesAmount(processData);
         taskStatistics.setFilePath(processData.getAbsolutePath());
 
+        // CLI 引数のロード (-vw, -vh, -df, -fr)
         final int imgWidth = inputCLIArgumentsHolder.getArgument(IMAGE_WIDTH);
         final int imgHeight = inputCLIArgumentsHolder.getArgument(IMAGE_HEIGHT);
         final int duplicateFactor = inputCLIArgumentsHolder.getArgument(DUPLICATE_FACTOR);
-
-        final int yPlaneSize = imgWidth * imgHeight;
-        final int uvPlaneSize = (imgWidth / 2) * (imgHeight / 2);
-        final int frameSizeYuv = yPlaneSize + (uvPlaneSize * 2);
+        final int maxPixelsCapacity = imgWidth * imgHeight;
 
         final int localTempRowLength = imgWidth / duplicateFactor;
-        final byte[] localTempRow = new byte[localTempRowLength];
-        final byte[] localRowCache = new byte[imgWidth];
+        final int[] localTempRow = new int[localTempRowLength];
+
+        final int pixelZero = bytesUtils.bitToPixel(0);
+        final int pixelOne  = bytesUtils.bitToPixel(1);
+
+        final int localRowCacheLength = imgWidth;
+        final int[] localRowCache = new int[localRowCacheLength];
 
         File resultVideoFile = null;
 
         try {
             resultVideoFile = fileUtils.getFilesToVideosResultFile(processData, localLastZeroBytesCount);
 
+            // 【Java 26 FFM API】Arena でネイティブメモリのライフサイクルを自動管理 (GCゼロ)
             try (Arena arena = Arena.ofConfined();
                  BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(processData), IO_BUFFER_SIZE);
                  FFmpegFrameRecorder videoRecorder = new FFmpegFrameRecorder(resultVideoFile, imgWidth, imgHeight)) {
 
-                // YUV420Pフレーム全体のネイティブメモリを確保 (64バイトアライメント)
-                final MemorySegment nativeFrameSegment = arena.allocate((long) frameSizeYuv, 64);
-                
-                // 色度(U/V)プレーンを固定値 128 (0x80 = 完全無色/モノクロ) で事前に初期化
-                final long uOffset = yPlaneSize;
-                final long vOffset = yPlaneSize + uvPlaneSize;
-                nativeFrameSegment.asSlice(uOffset, (long) uvPlaneSize * 2).fill((byte) 0x80);
+                // 【Apple M4 アーキテクチャ最適化】128バイトアライメント（M4のL1D/L2/SLCキャッシュラインサイズ）でアロケート
+                final MemorySegment nativePixelSegment = arena.allocate((long) maxPixelsCapacity * 4, M4_CACHE_LINE_ALIGNMENT);
+                final ByteBuffer reusableByteBuffer = nativePixelSegment.asByteBuffer();
 
-                // 各プレーンの ByteBuffer を生成
-                final ByteBuffer yBuffer = nativeFrameSegment.asSlice(0, yPlaneSize).asByteBuffer();
-                final ByteBuffer uBuffer = nativeFrameSegment.asSlice(uOffset, uvPlaneSize).asByteBuffer();
-                final ByteBuffer vBuffer = nativeFrameSegment.asSlice(vOffset, uvPlaneSize).asByteBuffer();
-
-                // JavaCV Frame 設定
-                final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 1);
-                reusableFrame.image = new Buffer[] { yBuffer, uBuffer, vBuffer };
-                reusableFrame.imageStride = imgWidth; // int 型に修正
-
-                // FFmpeg レコーダー設定
                 videoRecorder.setFormat("mp4");
                 videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
 
                 String activeCodec = (System.getenv("GITHUB_ACTIONS") != null) ? "libx265" : "hevc_videotoolbox";
                 videoRecorder.setVideoCodecName(activeCodec);
-                videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
+                videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P); // YouTube変換に強いYUV420P指定
 
-                // FourCC パッチ処理を不要にする設定
-                videoRecorder.setOption("tag:v", "hvc1");
-
+                // --- Snow Leopard 究極安定・低消費電力チューニング ---
                 videoRecorder.setVideoQuality(90);
                 videoRecorder.setOption("movflags", "faststart");
                 videoRecorder.setVideoOption("realtime", "1");
@@ -114,7 +88,10 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
                 videoRecorder.start();
 
-                int currentPixelIndex = 0;
+                final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 4);
+                reusableFrame.image[0] = reusableByteBuffer;
+
+                final EncoderContext ctx = new EncoderContext();
                 int localTempRowIndex = 0;
 
                 final byte[] readBuffer = new byte[READ_CHUNK_SIZE];
@@ -124,39 +101,43 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                     for (int i = 0; i < bytesRead; i++) {
                         final int aByte = readBuffer[i] & 0xFF;
 
-                        // LUT (Look-Up Table) 参照による一括コピー (M4 L1キャッシュ最適化)
-                        System.arraycopy(BYTE_TO_Y8_LUT[aByte], 0, localTempRow, localTempRowIndex, 8);
-                        localTempRowIndex += 8;
+                        // M4のパイプライン処理に最適化された直列化アンロール
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x80) != 0) ? pixelOne : pixelZero;
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x40) != 0) ? pixelOne : pixelZero;
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x20) != 0) ? pixelOne : pixelZero;
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x10) != 0) ? pixelOne : pixelZero;
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x08) != 0) ? pixelOne : pixelZero;
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x04) != 0) ? pixelOne : pixelZero;
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x02) != 0) ? pixelOne : pixelZero;
+                        localTempRow[localTempRowIndex++] = ((aByte & 0x01) != 0) ? pixelOne : pixelZero;
 
                         if (localTempRowIndex >= localTempRowLength) {
-                            currentPixelIndex = flushRowToNativeMemory(
-                                    localTempRow, localTempRowLength, localRowCache,
-                                    duplicateFactor, yPlaneSize, nativeFrameSegment,
-                                    videoRecorder, reusableFrame, currentPixelIndex
-                            );
+                            flushRowToNativeMemorySegment(localTempRow, localTempRowLength, localRowCache, localRowCacheLength,
+                                    duplicateFactor, maxPixelsCapacity, nativePixelSegment, videoRecorder, reusableFrame, ctx);
                             localTempRowIndex = 0;
                         }
                     }
                 }
 
-                // 末尾パディング処理
+                // 末尾のゼロパディング処理
                 if (localTempRowIndex > 0) {
-                    Arrays.fill(localTempRow, localTempRowIndex, localTempRowLength, Y_ZERO);
-                    currentPixelIndex = flushRowToNativeMemory(
-                            localTempRow, localTempRowLength, localRowCache,
-                            duplicateFactor, yPlaneSize, nativeFrameSegment,
-                            videoRecorder, reusableFrame, currentPixelIndex
-                    );
+                    Arrays.fill(localTempRow, localTempRowIndex, localTempRowLength, ZERO);
+                    flushRowToNativeMemorySegment(localTempRow, localTempRowLength, localRowCache, localRowCacheLength,
+                            duplicateFactor, maxPixelsCapacity, nativePixelSegment, videoRecorder, reusableFrame, ctx);
                 }
 
-                // 残余バッファを一括パディングして最終フレーム書き込み
-                if (currentPixelIndex > 0) {
-                    if (currentPixelIndex < yPlaneSize) {
-                        long offsetBytes = currentPixelIndex;
-                        long lengthBytes = (long) yPlaneSize - currentPixelIndex;
-                        nativeFrameSegment.asSlice(offsetBytes, lengthBytes).fill(Y_ZERO);
+                // 残余バッファを一括パディングしてVRAM/エンコーダへフラッシュ
+                if (ctx.currentPixelIndex > 0) {
+                    if (ctx.currentPixelIndex < maxPixelsCapacity) {
+                        final int remainingInts = maxPixelsCapacity - ctx.currentPixelIndex;
+
+                        // MemorySegment.fill によるハードウェア一括メモリ埋め (0xFF)
+                        long offsetBytes = (long) ctx.currentPixelIndex * 4;
+                        long lengthBytes = (long) remainingInts * 4;
+                        nativePixelSegment.asSlice(offsetBytes, lengthBytes).fill((byte) 0xFF);
                     }
-                    videoRecorder.record(reusableFrame, AV_PIX_FMT_YUV420P);
+
+                    videoRecorder.record(reusableFrame, AV_PIX_FMT_RGBA);
                     taskStatistics.poll();
                 }
             }
@@ -165,48 +146,81 @@ public class FilesToVideosTransformerTask extends TransformerTask {
             throw new TransformException(COMMON_EXCEPTION_DESCRIPTION, e);
         }
 
+        if (resultVideoFile != null) {
+            convertHev1ToHvc1(resultVideoFile);
+        }
+
         taskStatistics.logResult();
         log.info("File {} was processed successfully", processData);
     }
 
-    private int flushRowToNativeMemory(byte[] localTempRow, int localTempRowLength,
-                                        byte[] localRowCache, int duplicateFactor,
-                                        int yPlaneSize, MemorySegment nativeFrameSegment,
-                                        FFmpegFrameRecorder videoRecorder, Frame reusableFrame,
-                                        int currentPixelIndex) throws Exception {
+    /**
+     * 【Java 26 FFM API】MemorySegment への直接バルクコピー
+     * (NIO IntBuffer 境界チェックと JNI オーバーヘッドを完全排除)
+     */
+    private void flushRowToNativeMemorySegment(int[] localTempRow, final int localTempRowLength,
+                                                int[] localRowCache, final int localRowCacheLength,
+                                                final int duplicateFactor, final int maxPixelsCapacity,
+                                                MemorySegment nativePixelSegment, FFmpegFrameRecorder videoRecorder,
+                                                Frame reusableFrame, EncoderContext ctx) throws Exception {
 
+        // --- FAST PATH: duplicateFactor == 1 ---
         if (duplicateFactor == 1) {
-            if (currentPixelIndex + localTempRowLength > yPlaneSize) {
-                videoRecorder.record(reusableFrame, AV_PIX_FMT_YUV420P);
+            if (ctx.currentPixelIndex + localTempRowLength > maxPixelsCapacity) {
+                videoRecorder.record(reusableFrame, AV_PIX_FMT_RGBA);
                 taskStatistics.poll();
-                currentPixelIndex = 0;
+                ctx.currentPixelIndex = 0;
             }
 
-            // SIMD/NEON最適化バルクメモリコピー
-            MemorySegment.copy(localTempRow, 0, nativeFrameSegment, ValueLayout.JAVA_BYTE, currentPixelIndex, localTempRowLength);
-            return currentPixelIndex + localTempRowLength;
+            // ARM64 NEON/SIMD 命令に最適化された一括転送
+            MemorySegment.copy(localTempRow, 0, nativePixelSegment, ValueLayout.JAVA_INT, (long) ctx.currentPixelIndex * 4, localTempRowLength);
+            ctx.currentPixelIndex += localTempRowLength;
+            return;
         }
 
-        // duplicateFactor > 1 の拡大処理
+        // --- SLOW PATH: duplicateFactor > 1 (YouTube耐性用の横・縦拡大) ---
         int cacheIdx = 0;
         for (int i = 0; i < localTempRowLength; i++) {
-            final byte px = localTempRow[i];
+            final int px = localTempRow[i];
             for (int f = 0; f < duplicateFactor; f++) {
                 localRowCache[cacheIdx++] = px;
             }
         }
 
         for (int r = 0; r < duplicateFactor; r++) {
-            if (currentPixelIndex + localRowCache.length > yPlaneSize) {
-                videoRecorder.record(reusableFrame, AV_PIX_FMT_YUV420P);
+            if (ctx.currentPixelIndex + localRowCacheLength > maxPixelsCapacity) {
+                videoRecorder.record(reusableFrame, AV_PIX_FMT_RGBA);
                 taskStatistics.poll();
-                currentPixelIndex = 0;
+                ctx.currentPixelIndex = 0;
             }
 
-            MemorySegment.copy(localRowCache, 0, nativeFrameSegment, ValueLayout.JAVA_BYTE, currentPixelIndex, localRowCache.length);
-            currentPixelIndex += localRowCache.length;
+            MemorySegment.copy(localRowCache, 0, nativePixelSegment, ValueLayout.JAVA_INT, (long) ctx.currentPixelIndex * 4, localRowCacheLength);
+            ctx.currentPixelIndex += localRowCacheLength;
         }
+    }
 
-        return currentPixelIndex;
+    /**
+     * 高速インプレース FourCC パッチ ('hev1' -> 'hvc1')
+     */
+    private void convertHev1ToHvc1(File mp4File) {
+        if (mp4File == null || !mp4File.exists()) return;
+
+        try (RandomAccessFile raf = new RandomAccessFile(mp4File, "rw")) {
+            final int searchSize = (int) Math.min(raf.length(), 64 * 1024);
+            final byte[] searchBuffer = new byte[searchSize];
+            raf.readFully(searchBuffer);
+
+            for (int i = 0; i <= searchSize - 4; i++) {
+                if (searchBuffer[i] == 0x68 && searchBuffer[i+1] == 0x65 &&
+                    searchBuffer[i+2] == 0x76 && searchBuffer[i+3] == 0x31) { // 'h' 'e' 'v' '1'
+                    raf.seek(i);
+                    raf.write(new byte[]{0x68, 0x76, 0x63, 0x31}); // 'h' 'v' 'c' '1'
+                    return;
+                }
+            }
+            log.warn("FourCC 'hev1' not patched. Compatibility may be affected.");
+        } catch (Exception e) {
+            log.warn("Failed to patch MP4 FourCC.", e);
+        }
     }
 }
