@@ -81,26 +81,33 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-            private void processFile(File video, OutputStream outputStream) throws IOException {
+    private void processFile(File video, OutputStream outputStream) throws IOException {
+        int codecId = org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_NONE;
+
+        // 1. 【安全第一】メタデータ取得専用の別グラバーを一瞬だけ起動してコーデックを盗む
+        try (FFmpegFrameGrabber metaGrabber = new FFmpegFrameGrabber(video)) {
+            metaGrabber.start();
+            codecId = metaGrabber.getVideoCodec();
+            metaGrabber.stop(); // 瞬時に閉じる
+        } catch (Exception e) {
+            log.warn("Failed to pre-scan codec, falling back to CPU decoding: {}", e.getMessage());
+        }
+
+        // 2. 本番のデコード用グラバーを起動
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
             grabber.setOption("threads", "auto");
 
-            // 1. 【公式の正解】デコードを走らせず、コンテナとヘッダー情報のみを先読みする
-            grabber.start(false); 
-
-            // 2. 読み込まれたCodec IDを判定し、適切なM4ハードウェアデコーダーを指定
-            int codecId = grabber.getVideoCodec();
+            // 3. 盗み出したコーデックIDを元に、M4メディアエンジンを動的に撃ち分ける
             if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_H264) {
-                grabber.setVideoCodecName("h264_videotoolbox"); // H.264用のM4アクセラレータ
+                grabber.setVideoCodecName("h264_videotoolbox"); // H.264用M4回路
+                grabber.setOption("hwaccel", "videotoolbox");
             } else if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_HEVC) {
-                grabber.setVideoCodecName("hevc_videotoolbox"); // HEVC用のM4アクセラレータ
+                grabber.setVideoCodecName("hevc_videotoolbox"); // HEVC用M4回路
+                grabber.setOption("hwaccel", "videotoolbox");
             }
+            // 💡 ログにある「mpeg4」などの場合は、上記をスルーして安全にCPUデコード（デフォルト）に流れる
 
-            // 3. ハードウェアアクセラレーション自体をOS（VideoToolbox）に指定
-            grabber.setOption("hwaccel", "videotoolbox");
-
-            // 4. 【公式の正解】ヘッダー情報をパースした状態から、本番のストリームデコードを再開する
-            grabber.start(true);
+            grabber.start(); // 本番開始（1回しか呼ばないので絶対にクラッシュしない）
 
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
                 filter.start();
@@ -108,6 +115,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             }
         }
     }
+
 
 
     private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
