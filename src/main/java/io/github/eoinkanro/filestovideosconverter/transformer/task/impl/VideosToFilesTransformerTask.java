@@ -81,26 +81,26 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-        private void processFile(File video, OutputStream outputStream) throws IOException {
+            private void processFile(File video, OutputStream outputStream) throws IOException {
         try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
             grabber.setOption("threads", "auto");
 
-            // 1. 【本物】動画のデコードをせず、コンテナ・ヘッダー情報（Format）だけを瞬時に先読みする
-            grabber.startFormat(); 
+            // 1. 【公式の正解】デコードを走らせず、コンテナとヘッダー情報のみを先読みする
+            grabber.start(false); 
 
-            // 2. コーデックIDを判定し、適切なM4ハードウェア回路を指定
+            // 2. 読み込まれたCodec IDを判定し、適切なM4ハードウェアデコーダーを指定
             int codecId = grabber.getVideoCodec();
             if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_H264) {
-                grabber.setVideoCodecName("h264_videotoolbox"); // H.264用M4回路
+                grabber.setVideoCodecName("h264_videotoolbox"); // H.264用のM4アクセラレータ
             } else if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_HEVC) {
-                grabber.setVideoCodecName("hevc_videotoolbox"); // HEVC用M4回路
+                grabber.setVideoCodecName("hevc_videotoolbox"); // HEVC用のM4アクセラレータ
             }
 
-            // 3. アクセラレーション自体の有効化
+            // 3. ハードウェアアクセラレーション自体をOS（VideoToolbox）に指定
             grabber.setOption("hwaccel", "videotoolbox");
 
-            // 4. 本番のフレーム読み込み・デコードを開始
-            grabber.start();
+            // 4. 【公式の正解】ヘッダー情報をパースした状態から、本番のストリームデコードを再開する
+            grabber.start(true);
 
             try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
                 filter.start();
@@ -108,6 +108,7 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             }
         }
     }
+
 
     private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
         Frame frame;
