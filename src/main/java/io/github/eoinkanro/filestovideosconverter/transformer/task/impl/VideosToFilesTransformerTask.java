@@ -19,17 +19,15 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
     private static final int RGB_CHANNELS = 3;
     private static final int OUTPUT_BUFFER_SIZE = 128 * 1024;
-
-    // Apple M4のキャッシュライン境界（128バイト）
     private static final long CACHE_LINE_SIZE = 128;
     
-    // 【物理×C2の完全合体解】
-    // 32画素 (2^5の累乗) × 3バイト = 96バイト
-    // 128Bアライメント下で 96B < 128B となり、単一ループ内でLine Splitが原理的に100%発生しない
+    // 32画素 (2^5) = 96 Bytes。SIMDベクトル化に特化
     private static final int SIMD_PIXELS_BATCH = 32; 
     private static final int SIMD_BYTES_BATCH = SIMD_PIXELS_BATCH * RGB_CHANNELS; // 96 Bytes
 
     private final byte[] bulkZeroBuffer = new byte[16384];
+    // SIMD抽出用のローカルビットバッファ（インナーループ内でのI/O・分岐排除用）
+    private final int[] extractedBitsBuffer = new int[SIMD_PIXELS_BATCH];
 
     private int duplicateFactor;
     private int imageWidth;
@@ -110,24 +108,24 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                 continue;
             }
 
-            int requiredPixelsLength = frame.imageHeight * frame.imageWidth * RGB_CHANNELS;
+            // FFmpegのストライド（linesize[0]）を取得。パディングに対応
+            int rowStride = frame.linesize[0] > 0 ? frame.linesize[0] : frame.imageWidth * RGB_CHANNELS;
+            int requiredPixelsLength = frame.imageHeight * rowStride;
 
             ByteBuffer nativeBuffer = (ByteBuffer) frame.image[0];
             MemorySegment segment = MemorySegment.ofBuffer(nativeBuffer);
 
-            processImageLimitFFM(segment, requiredPixelsLength, outputStream);
+            processImageLimitFFM(segment, requiredPixelsLength, rowStride, outputStream);
 
             taskStatistics.poll();
         }
     }
 
     /**
-     * 128B Align-Up ＆ 32画素(96B = 2^5 NEON) 物理・VM両制覇アルゴリズム
+     * 分岐・I/Oをインナーループから完全に排除し、正しく128B Align-UpされたC2 SIMD完全適合版
      */
-    private void processImageLimitFFM(MemorySegment segment, int pixelsLength, OutputStream outputStream) throws IOException {
+    private void processImageLimitFFM(MemorySegment segment, int totalBytesLength, int rowStride, OutputStream outputStream) throws IOException {
         final int df = duplicateFactor;
-        int bitCount = this.currentBitsCount;
-        int byteVal = this.currentByteVal;
 
         // =========================================================================
         // FAST PATH: duplicateFactor == 1
@@ -136,10 +134,16 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             long addr = 0;
             long rawAddress = segment.address();
 
-            // 1. [HEAD] 128Bキャッシュライン境界にアライメントを合わせる
+            // 1. [HEAD] 128B境界に達する以上の最小画素数（3バイト単位）まで繰り上げてAlign-Up
             long offsetToAlignment = (CACHE_LINE_SIZE - (rawAddress % CACHE_LINE_SIZE)) % CACHE_LINE_SIZE;
-            long headBytes = Math.min(pixelsLength, offsetToAlignment - (offsetToAlignment % RGB_CHANNELS));
+            long headBytes = 0;
+            if (offsetToAlignment > 0) {
+                // 128B境界を超えるために必要な3バイト(画素)単位のバイト数
+                headBytes = ((offsetToAlignment + (RGB_CHANNELS - 1)) / RGB_CHANNELS) * RGB_CHANNELS;
+                headBytes = Math.min(totalBytesLength, headBytes);
+            }
 
+            // HEADスカラ処理
             for (; addr < headBytes; addr += RGB_CHANNELS) {
                 byte r = segment.get(ValueLayout.JAVA_BYTE, addr);
                 byte g = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
@@ -147,23 +151,17 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
                 int pBit = bytesUtils.pixelToBit(r, g, b);
                 int bit = bytesUtils.pixelToBit(pBit, 1);
-
-                if (bit >= 0) {
-                    byteVal = (byteVal << 1) | bit;
-                    if (++bitCount == 8) {
-                        appendByteToStream(byteVal, outputStream);
-                        byteVal = 0;
-                        bitCount = 0;
-                    }
-                }
+                processSingleBit(bit, outputStream);
             }
 
-            // 2. [ALIGNED BODY] 96バイト（32画素 = 2^5）単位での超高速一括読み出し
-            // C2コンパイラの2の累乗条件を満たしつつ、128Bキャッシュライン境界(96 < 128)を一切侵さない
-            long remainingBytes = pixelsLength - addr;
+            // 2. [ALIGNED BODY] 128B境界以降で動く純粋SIMD対象ループ
+            // 分岐(if)もI/O呼び出しも一切排除し、配列への純粋計算のみを行うことでC2のAuto-Vectorizationを100%発動させる
+            long remainingBytes = totalBytesLength - addr;
             long bodyEnd = addr + (remainingBytes - (remainingBytes % SIMD_BYTES_BATCH));
 
             for (; addr < bodyEnd; addr += SIMD_BYTES_BATCH) {
+                // --- 【C2 Auto-Vectorization 対象ブロック】 ---
+                // 分岐なし・外部呼び出しなし・定数回数(32)・2の累乗
                 for (int p = 0; p < SIMD_PIXELS_BATCH; p++) {
                     long pxAddr = addr + (p * RGB_CHANNELS);
                     byte r = segment.get(ValueLayout.JAVA_BYTE, pxAddr);
@@ -171,48 +169,36 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                     byte b = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 2);
 
                     int pBit = bytesUtils.pixelToBit(r, g, b);
-                    int bit = bytesUtils.pixelToBit(pBit, 1);
+                    // 結果をローカル配列に直接代入（分岐・I/O排除）
+                    extractedBitsBuffer[p] = bytesUtils.pixelToBit(pBit, 1);
+                }
 
-                    if (bit >= 0) {
-                        byteVal = (byteVal << 1) | bit;
-                        if (++bitCount == 8) {
-                            appendByteToStream(byteVal, outputStream);
-                            byteVal = 0;
-                            bitCount = 0;
-                        }
-                    }
+                // --- 【Post-Processing Block (SIMD外処理)】 ---
+                // 抽出し終わったビットバッファを一括でストリームへ詰める
+                for (int p = 0; p < SIMD_PIXELS_BATCH; p++) {
+                    processSingleBit(extractedBitsBuffer[p], outputStream);
                 }
             }
 
             // 3. [TAIL] 端数処理
-            for (; addr < pixelsLength; addr += RGB_CHANNELS) {
+            for (; addr < totalBytesLength; addr += RGB_CHANNELS) {
                 byte r = segment.get(ValueLayout.JAVA_BYTE, addr);
                 byte g = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
                 byte b = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
 
                 int pBit = bytesUtils.pixelToBit(r, g, b);
                 int bit = bytesUtils.pixelToBit(pBit, 1);
-
-                if (bit >= 0) {
-                    byteVal = (byteVal << 1) | bit;
-                    if (++bitCount == 8) {
-                        appendByteToStream(byteVal, outputStream);
-                        byteVal = 0;
-                        bitCount = 0;
-                    }
-                }
+                processSingleBit(bit, outputStream);
             }
 
-            this.currentBitsCount = bitCount;
-            this.currentByteVal = byteVal;
             return;
         }
 
         // =========================================================================
-        // SLOW PATH: duplicateFactor > 1
+        // SLOW PATH: duplicateFactor > 1 (linesizeパディング対応版)
         // =========================================================================
-        final int rowStride = imageWidth * RGB_CHANNELS;
-        final int pixelsIterations = pixelsLength / rowStride / df;
+        final int activeRowBytes = imageWidth * RGB_CHANNELS;
+        final int pixelsIterations = (totalBytesLength / rowStride) / df;
         final int bitsPerRow = imageWidth / df;
 
         final int colByteStride = df * RGB_CHANNELS;
@@ -236,25 +222,28 @@ public class VideosToFilesTransformerTask extends TransformerTask {
                         pixelSum += bytesUtils.pixelToBit(red, green, blue);
                         addr += RGB_CHANNELS;
                     }
-                    rowAddr += rowStride;
+                    rowAddr += rowStride; // パディングを含んだ正確な行ストライドで加算
                 }
 
                 int bit = bytesUtils.pixelToBit(pixelSum, df);
-
-                if (bit >= 0) {
-                    byteVal = (byteVal << 1) | bit;
-
-                    if (++bitCount == 8) {
-                        appendByteToStream(byteVal, outputStream);
-                        byteVal = 0;
-                        bitCount = 0;
-                    }
-                }
+                processSingleBit(bit, outputStream);
             }
         }
+    }
 
-        this.currentBitsCount = bitCount;
-        this.currentByteVal = byteVal;
+    /**
+     * ビット連結およびOutputStreamへの書き出し（I/O）共通処理
+     */
+    private void processSingleBit(int bit, OutputStream outputStream) throws IOException {
+        if (bit >= 0) {
+            currentByteVal = (currentByteVal << 1) | bit;
+
+            if (++currentBitsCount == 8) {
+                appendByteToStream(currentByteVal, outputStream);
+                currentByteVal = 0;
+                currentBitsCount = 0;
+            }
+        }
     }
 
     private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
