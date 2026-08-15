@@ -82,40 +82,21 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     }
 
     private void processFile(File video, OutputStream outputStream) throws IOException {
-        int codecId = org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_NONE;
+    try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+        
+        // 【決定打】JavaCVネイティブAPIでVideoToolbox(HWDevice)を明示指定
+        grabber.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_NV12); // HWの素の出力フォーマット
+        grabber.setVideoHWAccel("videotoolbox"); // 汎用optionではなく専用メソッドを使う
 
-        // 1. 【安全第一】メタデータ取得専用の別グラバーを一瞬だけ起動してコーデックを盗む
-        try (FFmpegFrameGrabber metaGrabber = new FFmpegFrameGrabber(video)) {
-            metaGrabber.start();
-            codecId = metaGrabber.getVideoCodec();
-            metaGrabber.stop(); // 瞬時に閉じる
-        } catch (Exception e) {
-            log.warn("Failed to pre-scan codec, falling back to CPU decoding: {}", e.getMessage());
-        }
+        grabber.start();
 
-        // 2. 本番のデコード用グラバーを起動
-        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
-            grabber.setOption("threads", "auto");
-
-            // 3. 盗み出したコーデックIDを元に、M4メディアエンジンを動的に撃ち分ける
-            if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_H264) {
-                grabber.setVideoCodecName("h264_videotoolbox"); // H.264用M4回路
-                grabber.setOption("hwaccel", "videotoolbox");
-            } else if (codecId == org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_HEVC) {
-                grabber.setVideoCodecName("hevc_videotoolbox"); // HEVC用M4回路
-                grabber.setOption("hwaccel", "videotoolbox");
-            }
-            // 💡 ログにある「mpeg4」などの場合は、上記をスルーして安全にCPUデコード（デフォルト）に流れる
-
-            grabber.start(); // 本番開始（1回しか呼ばないので絶対にクラッシュしない）
-
-            try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
-                filter.start();
-                processFile(grabber, filter, outputStream);
-            }
+        // FFmpegFrameFilterでNV12 -> RGB24へ変換（Filter側でM4のNEON最適化swscaleを効かせる）
+        try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
+            filter.start();
+            processFile(grabber, filter, outputStream);
         }
     }
-
+}
 
 
     private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
