@@ -25,6 +25,8 @@ public abstract class TransformerTask implements Runnable {
     @Autowired
     protected FileUtils fileUtils;
     @Autowired
+    protected BytesUtils bytesUtils;
+    @Autowired
     protected CommonUtils commonUtils;
     @Autowired
     protected InputCLIArgumentsHolder inputCLIArgumentsHolder;
