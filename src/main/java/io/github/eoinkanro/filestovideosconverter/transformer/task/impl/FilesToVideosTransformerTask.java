@@ -78,32 +78,37 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 final MemorySegment nativePixelSegment = arena.allocate(totalFrameBytes, M4_CACHE_LINE_ALIGNMENT);
                 final ByteBuffer reusableByteBuffer = nativePixelSegment.asByteBuffer();
 
-        // ==================== 基本フォーマット ====================
-        videoRecorder.setFormat("mp4");
-        videoRecorder.setOption("movflags", "faststart"); // ★ここを修正 (setOption を使用)
-        videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
+// ==================== 基本フォーマット ====================
+videoRecorder.setFormat("mp4");
+videoRecorder.setOption("movflags", "faststart");
+videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
 
-        // ==================== コーデック指定 ====================
-        String activeCodec = (System.getenv("GITHUB_ACTIONS") != null) ? "libx265" : "hevc_videotoolbox";
-        videoRecorder.setVideoCodecName(activeCodec);
-        videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
+// ==================== コーデック指定 ====================
+String activeCodec = (System.getenv("GITHUB_ACTIONS") != null) ? "libx265" : "hevc_videotoolbox";
+videoRecorder.setVideoCodecName(activeCodec);
+videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
 
-// ==================== VideoToolbox 向けフルパワー & 圧縮優先 (品質60) ====================
-        if ("hevc_videotoolbox".equals(activeCodec)) {
-            videoRecorder.setVideoOption("q:v", "75");              // 品質ベースVBR (圧縮優先)
-            videoRecorder.setVideoOption("prio_speed", "0");       // 0: 圧縮効率・画質最優先
-            videoRecorder.setVideoOption("power_efficient", "0");  // 0: 省電力解除 (M4 HWフル稼働)
-            videoRecorder.setVideoOption("realtime", "0");         // 0: 時間制限なしで徹底圧縮
-            videoRecorder.setVideoOption("spatial_aq", "0");       // 0: 白黒ドットの歪み防止
-        } else {
-            // GitHub Actions (libx265) 向け
-            videoRecorder.setVideoOption("crf", "28");
-            videoRecorder.setVideoOption("preset", "ultrafast");
-        }
+// ==================== CRF / 品質ベースVBR の設定 ====================
+// ビットレート固定を明示的に解除 (0 = 品質モードを優先)
+videoRecorder.setVideoBitrate(0);
 
-        videoRecorder.setMaxBFrames(0);
+// 品質スケール設定 (0〜100) -> 60 は圧縮率と復元精度の黄金比
+videoRecorder.setVideoQuality(60); 
 
-        videoRecorder.start();
+if ("hevc_videotoolbox".equals(activeCodec)) {
+    // M4 ハードウェアをフルパワー＆圧縮優先で動かす
+    videoRecorder.setVideoOption("prio_speed", "0");       // 圧縮効率最優先
+    videoRecorder.setVideoOption("power_efficient", "0");  // フルパワー稼働
+    videoRecorder.setVideoOption("realtime", "0");         // 徹底圧縮
+    videoRecorder.setVideoOption("spatial_aq", "0");       // ドットの輪郭を保持
+} else {
+    // CI (GitHub Actions) 向け
+    videoRecorder.setVideoOption("preset", "ultrafast");
+}
+
+videoRecorder.setMaxBFrames(0);
+
+videoRecorder.start();
 
                 final Frame reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 4);
                 // FFmpeg linesize[0] に 128B ストライドを明示
