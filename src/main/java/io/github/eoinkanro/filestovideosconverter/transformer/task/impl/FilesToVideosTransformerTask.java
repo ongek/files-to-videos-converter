@@ -90,7 +90,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
 // ==================== VideoToolbox 向けフルパワー & 圧縮優先 (品質60) ====================
         if ("hevc_videotoolbox".equals(activeCodec)) {
-            videoRecorder.setVideoOption("q:v", "60");              // 品質ベースVBR (圧縮優先)
+            videoRecorder.setVideoOption("q:v", "75");              // 品質ベースVBR (圧縮優先)
             videoRecorder.setVideoOption("prio_speed", "0");       // 0: 圧縮効率・画質最優先
             videoRecorder.setVideoOption("power_efficient", "0");  // 0: 省電力解除 (M4 HWフル稼働)
             videoRecorder.setVideoOption("realtime", "0");         // 0: 時間制限なしで徹底圧縮
