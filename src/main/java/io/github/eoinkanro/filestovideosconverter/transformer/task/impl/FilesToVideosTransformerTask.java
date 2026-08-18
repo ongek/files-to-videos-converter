@@ -121,7 +121,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         recorder.setPixelFormat(AV_PIX_FMT_YUV420P);
 
         recorder.setVideoBitrate(0);
-        recorder.setVideoQuality(60);
+        recorder.setVideoQuality(50);
 
         if ("hevc_videotoolbox".equals(activeCodec)) {
             recorder.setVideoOption("prio_speed", "0");
