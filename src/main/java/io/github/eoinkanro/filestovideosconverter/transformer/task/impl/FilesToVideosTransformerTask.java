@@ -78,19 +78,27 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 final MemorySegment nativePixelSegment = arena.allocate(totalFrameBytes, M4_CACHE_LINE_ALIGNMENT);
                 final ByteBuffer reusableByteBuffer = nativePixelSegment.asByteBuffer();
 
+                // ==================== 基本フォーマット ====================
                 videoRecorder.setFormat("mp4");
+                videoRecorder.setFormatOption("movflags", "faststart");
                 videoRecorder.setFrameRate(inputCLIArgumentsHolder.getArgument(FRAMERATE));
 
-                String activeCodec = (System.getenv("GITHUB_ACTIONS") != null) ? "libx265" : "hevc_videotoolbox";
-                videoRecorder.setVideoCodecName(activeCodec);
+                // ==================== コーデック指定 ====================
+                videoRecorder.setVideoCodecName("hevc_videotoolbox");
                 videoRecorder.setPixelFormat(AV_PIX_FMT_YUV420P);
 
-                // --- 安定・低消費電力チューニング ---
-                videoRecorder.setVideoQuality(90);
-                videoRecorder.setOption("movflags", "faststart");
-                videoRecorder.setVideoOption("realtime", "1");
-                videoRecorder.setMaxBFrames(0);
-                videoRecorder.setOption("bf", "0");
+                // ==================== フルパワー & 圧縮優先 (品質60) ====================
+                // 1. 品質ベースVBR (0〜100、60は圧縮率と可逆性のバランスが良い)
+                videoRecorder.setVideoOption("q:v", "60");
+
+                // 2. M4 メディアエンジンのフル稼働設定
+                videoRecorder.setVideoOption("prio_speed", "0");       // 0: 圧縮効率・画質最優先 (速度より圧縮率)
+                videoRecorder.setVideoOption("power_efficient", "0");  // 0: 省電力解除 (M4 HWフル稼働)
+                videoRecorder.setVideoOption("realtime", "0");         // 0: 時間制限なしで徹底的に圧縮
+
+                // 3. データ保護
+                videoRecorder.setVideoOption("spatial_aq", "0");       // 0: 白黒ドットの輪郭破壊を防止
+                videoRecorder.setMaxBFrames(0);                        // デコードの確実性と高速化のためBフレームは0推奨
 
                 videoRecorder.start();
 
