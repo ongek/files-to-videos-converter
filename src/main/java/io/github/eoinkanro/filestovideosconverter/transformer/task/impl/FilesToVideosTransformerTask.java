@@ -8,26 +8,25 @@ import org.bytedeco.javacv.FFmpegFrameRecorder;
 import org.bytedeco.javacv.Frame;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
-import java.util.Arrays;
 
-// 【追加】VIDEO_QUALITY をインポート
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.*;
-import static io.github.eoinkanro.filestovideosconverter.utils.BytesUtils.ZERO;
 import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGBA;
 import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_YUV420P;
 
 @Log4j2
 public class FilesToVideosTransformerTask extends TransformerTask {
 
-    private static final int IO_BUFFER_SIZE = 1024 * 1024; // 1MB ディスク一括読み込みバッファ
     private static final long M4_CACHE_LINE_ALIGNMENT = 128L; // Apple M4 キャッシュライン (128 bytes)
     private static final byte PADDING_BYTE = (byte) 0xFF;
+
+    // 【M4 128B キャッシュライン専用定数】df=4 用の 16 long (128 bytes) 展開テーブル
+    private static final long BLACK_PAIR = 0xFF000000_FF000000L; // 黒・黒 (8 bytes)
+    private static final long WHITE_PAIR = 0xFFFFFFFF_FFFFFFFFL; // 白・白 (8 bytes)
 
     public FilesToVideosTransformerTask(File processData) {
         super(processData);
@@ -44,60 +43,43 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         final int imgHeight = inputCLIArgumentsHolder.getArgument(IMAGE_HEIGHT);
         final int duplicateFactor = inputCLIArgumentsHolder.getArgument(DUPLICATE_FACTOR);
 
+        // 128B アライメントされたストライドとフレーム総サイズ
         final int rawRowBytes = imgWidth * 4;
         final long alignedRowBytes = (rawRowBytes + (M4_CACHE_LINE_ALIGNMENT - 1)) & ~(M4_CACHE_LINE_ALIGNMENT - 1);
         final long totalFrameBytes = alignedRowBytes * imgHeight;
-
-        // BytesUtils の定数 LUT を直接使用 (毎回のメモリ割り当てゼロ)
-        final int[] bitToPixelFlatLut = BytesUtils.BIT_TO_PIXEL_FLAT_LUT;
 
         File resultVideoFile = null;
 
         try {
             resultVideoFile = fileUtils.getFilesToVideosResultFile(processData, localLastZeroBytesCount);
 
+            // 【Java 26 FFM API】mmap とネイティブメモリを単一の Arena で完全ゼロコピー管理
             try (Arena arena = Arena.ofConfined();
-                 FileInputStream inputStream = new FileInputStream(processData);
+                 RandomAccessFile raf = new RandomAccessFile(processData, "r");
+                 FileChannel fileChannel = raf.getChannel();
                  FFmpegFrameRecorder videoRecorder = createConfiguredRecorder(resultVideoFile, imgWidth, imgHeight)) {
+
+                final long fileSize = processData.length();
+                // 入力ファイルをダイレクトにメモリマップ (ディスクリードのシステムコール全廃)
+                final MemorySegment inputMappedSegment = (fileSize > 0)
+                        ? fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, arena)
+                        : MemorySegment.NULL;
 
                 videoRecorder.start();
 
-                final NativeFrameWriter frameWriter = new NativeFrameWriter(
+                final NativeFrameStreamWriter frameWriter = new NativeFrameStreamWriter(
                         arena, videoRecorder, taskStatistics, imgWidth, imgHeight, duplicateFactor, alignedRowBytes, totalFrameBytes
                 );
 
-                final int localTempRowLength = imgWidth / duplicateFactor;
-                final int[] localTempRow = new int[localTempRowLength];
-                final byte[] readBuffer = new byte[IO_BUFFER_SIZE];
-                int localTempRowIndex = 0;
-                int bytesRead;
-
-                while ((bytesRead = inputStream.read(readBuffer)) >= 0) {
-                    for (int i = 0; i < bytesRead; i++) {
-                        final int lutOffset = (readBuffer[i] & 0xFF) << 3;
-                        localTempRow[localTempRowIndex]     = bitToPixelFlatLut[lutOffset];
-                        localTempRow[localTempRowIndex + 1] = bitToPixelFlatLut[lutOffset + 1];
-                        localTempRow[localTempRowIndex + 2] = bitToPixelFlatLut[lutOffset + 2];
-                        localTempRow[localTempRowIndex + 3] = bitToPixelFlatLut[lutOffset + 3];
-                        localTempRow[localTempRowIndex + 4] = bitToPixelFlatLut[lutOffset + 4];
-                        localTempRow[localTempRowIndex + 5] = bitToPixelFlatLut[lutOffset + 5];
-                        localTempRow[localTempRowIndex + 6] = bitToPixelFlatLut[lutOffset + 6];
-                        localTempRow[localTempRowIndex + 7] = bitToPixelFlatLut[lutOffset + 7];
-                        localTempRowIndex += 8;
-
-                        if (localTempRowIndex >= localTempRowLength) {
-                            frameWriter.writeRow(localTempRow);
-                            localTempRowIndex = 0;
-                        }
-                    }
+                // ヒープ配列を一切介さず、mmap から VRAM/NativeMemory へダイレクトストリーム書き込み
+                long inputOffset = 0;
+                while (inputOffset < fileSize) {
+                    byte b = inputMappedSegment.get(ValueLayout.JAVA_BYTE, inputOffset++);
+                    frameWriter.writeByte(b);
                 }
 
-                if (localTempRowIndex > 0) {
-                    Arrays.fill(localTempRow, localTempRowIndex, localTempRowLength, ZERO);
-                    frameWriter.writeRow(localTempRow);
-                }
-
-                frameWriter.flushFinalFrame();
+                // フレームと行のパディング＆最終フラッシュ
+                frameWriter.finish();
             }
         } catch (Exception e) {
             log.error(COMMON_EXCEPTION_DESCRIPTION, e);
@@ -122,7 +104,6 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         recorder.setVideoCodecName(activeCodec);
         recorder.setPixelFormat(AV_PIX_FMT_YUV420P);
 
-        // 【修正】CLI 引数 (-vq, --videoQuality) から動的に品質を取得して設定
         final int videoQuality = inputCLIArgumentsHolder.getArgument(VIDEO_QUALITY);
         recorder.setVideoBitrate(0);
         recorder.setVideoQuality(videoQuality);
@@ -166,28 +147,35 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         }
     }
 
-    private static class NativeFrameWriter {
+    /**
+     * 【Direct Native Streamer】
+     * 中間 Java 配列を完全全廃し、mmap から VRAM へ直接 128B キャッシュライン単位で書き込む極限クラス
+     */
+    private static class NativeFrameStreamWriter {
         private final FFmpegFrameRecorder videoRecorder;
         private final Object taskStatistics;
         private final int imgWidth;
         private final int imgHeight;
         private final int duplicateFactor;
         private final long alignedRowBytes;
+        private final long rowSizeBytes;
         private final MemorySegment nativePixelSegment;
         private final Frame reusableFrame;
-        private final int[] localRowCache;
-        private int currentRowInFrame = 0;
 
-        public NativeFrameWriter(Arena arena, FFmpegFrameRecorder videoRecorder,
-                                 Object taskStatistics, int imgWidth, int imgHeight,
-                                 int duplicateFactor, long alignedRowBytes, long totalFrameBytes) {
+        private int currentRowInFrame = 0;
+        private int currentPixelInRow = 0;
+        private long currentRowBaseOffset = 0;
+
+        public NativeFrameStreamWriter(Arena arena, FFmpegFrameRecorder videoRecorder,
+                                       Object taskStatistics, int imgWidth, int imgHeight,
+                                       int duplicateFactor, long alignedRowBytes, long totalFrameBytes) {
             this.videoRecorder = videoRecorder;
             this.taskStatistics = taskStatistics;
             this.imgWidth = imgWidth;
             this.imgHeight = imgHeight;
             this.duplicateFactor = duplicateFactor;
             this.alignedRowBytes = alignedRowBytes;
-            this.localRowCache = (duplicateFactor > 1) ? new int[imgWidth] : null;
+            this.rowSizeBytes = (long) imgWidth * 4;
 
             this.nativePixelSegment = arena.allocate(totalFrameBytes, M4_CACHE_LINE_ALIGNMENT);
             this.reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 4);
@@ -195,39 +183,95 @@ public class FilesToVideosTransformerTask extends TransformerTask {
             this.reusableFrame.image[0] = this.nativePixelSegment.asByteBuffer();
         }
 
-        public void writeRow(int[] localTempRow) throws Exception {
-            if (duplicateFactor == 1) {
-                ensureFrameCapacity();
-                long rowOffsetBytes = currentRowInFrame * alignedRowBytes;
-                MemorySegment.copy(localTempRow, 0, nativePixelSegment, ValueLayout.JAVA_INT, rowOffsetBytes, imgWidth);
-                currentRowInFrame++;
+        /**
+         * 1 バイトを Native メモリへ直接展開
+         */
+        public void writeByte(byte b) throws Exception {
+            ensureFrameRow();
+
+            // =========================================================================
+            // 【M4 FAST PATH: df == 4】1 バイト -> 横 32 ピクセル (128B キャッシュライン直書き)
+            // =========================================================================
+            if (duplicateFactor == 4) {
+                long writeOffset = currentRowBaseOffset + ((long) currentPixelInRow << 2);
+                int val = b & 0xFF;
+
+                // 8 ビットをそれぞれ 16 バイト (4ピクセル = 2 long) ずつ直書き
+                for (int bit = 7; bit >= 0; bit--) {
+                    long pair = ((val & (1 << bit)) != 0) ? BLACK_PAIR : WHITE_PAIR;
+                    nativePixelSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset, pair);
+                    nativePixelSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 8, pair);
+                    writeOffset += 16;
+                }
+
+                currentPixelInRow += 32;
+                if (currentPixelInRow >= imgWidth) {
+                    commitRow();
+                }
                 return;
             }
 
-            int cacheIdx = 0;
-            for (int px : localTempRow) {
+            // =========================================================================
+            // 【FAST PATH: df == 1】1 バイト -> 横 8 ピクセル (32B 直書き)
+            // =========================================================================
+            if (duplicateFactor == 1) {
+                long writeOffset = currentRowBaseOffset + ((long) currentPixelInRow << 2);
+                int lutOffset = (b & 0xFF) << 3;
+
+                for (int p = 0; p < 8; p++) {
+                    nativePixelSegment.set(ValueLayout.JAVA_INT, writeOffset + (p << 2), BytesUtils.BIT_TO_PIXEL_FLAT_LUT[lutOffset + p]);
+                }
+
+                currentPixelInRow += 8;
+                if (currentPixelInRow >= imgWidth) {
+                    commitRow();
+                }
+                return;
+            }
+
+            // =========================================================================
+            // 【汎用 PATH: 任意の df】
+            // =========================================================================
+            long writeOffset = currentRowBaseOffset + ((long) currentPixelInRow << 2);
+            int val = b & 0xFF;
+
+            for (int bit = 7; bit >= 0; bit--) {
+                int px = ((val & (1 << bit)) != 0) ? BytesUtils.ONE : BytesUtils.ZERO;
                 for (int f = 0; f < duplicateFactor; f++) {
-                    localRowCache[cacheIdx++] = px;
+                    nativePixelSegment.set(ValueLayout.JAVA_INT, writeOffset, px);
+                    writeOffset += 4;
                 }
             }
 
-            ensureFrameCapacity();
-            long firstRowOffset = currentRowInFrame * alignedRowBytes;
-            MemorySegment.copy(localRowCache, 0, nativePixelSegment, ValueLayout.JAVA_INT, firstRowOffset, imgWidth);
-            currentRowInFrame++;
-
-            long rowSizeBytes = (long) imgWidth * 4;
-            MemorySegment firstRowSlice = nativePixelSegment.asSlice(firstRowOffset, rowSizeBytes);
-
-            for (int r = 1; r < duplicateFactor; r++) {
-                ensureFrameCapacity();
-                long nextRowOffset = currentRowInFrame * alignedRowBytes;
-                nativePixelSegment.asSlice(nextRowOffset, rowSizeBytes).copyFrom(firstRowSlice);
-                currentRowInFrame++;
+            currentPixelInRow += (duplicateFactor << 3);
+            if (currentPixelInRow >= imgWidth) {
+                commitRow();
             }
         }
 
-        private void ensureFrameCapacity() throws Exception {
+        private void ensureFrameRow() {
+            currentRowBaseOffset = (long) currentRowInFrame * alignedRowBytes;
+        }
+
+        /**
+         * 1 行分の横展開が完了した時のコミット処理（縦方向 Native-to-Native コピー ＆ フレーム書き出し）
+         */
+        private void commitRow() throws Exception {
+            currentPixelInRow = 0;
+            long firstRowOffset = currentRowBaseOffset;
+            currentRowInFrame++;
+
+            // 縦方向拡大: 1行目をNative間で高速複製 (memcpy)
+            if (duplicateFactor > 1) {
+                MemorySegment firstRowSlice = nativePixelSegment.asSlice(firstRowOffset, rowSizeBytes);
+                for (int r = 1; r < duplicateFactor; r++) {
+                    long nextRowOffset = (long) currentRowInFrame * alignedRowBytes;
+                    nativePixelSegment.asSlice(nextRowOffset, rowSizeBytes).copyFrom(firstRowSlice);
+                    currentRowInFrame++;
+                }
+            }
+
+            // フレームが満杯になったらエンコーダへ
             if (currentRowInFrame >= imgHeight) {
                 videoRecorder.record(reusableFrame, AV_PIX_FMT_RGBA);
                 if (taskStatistics instanceof io.github.eoinkanro.filestovideosconverter.transformer.task.TaskStatistics stats) {
@@ -237,10 +281,19 @@ public class FilesToVideosTransformerTask extends TransformerTask {
             }
         }
 
-        public void flushFinalFrame() throws Exception {
+        public void finish() throws Exception {
+            // 行の残余があれば白(ZERO)で埋めてコミット
+            if (currentPixelInRow > 0) {
+                long writeOffset = currentRowBaseOffset + ((long) currentPixelInRow << 2);
+                long remainingBytes = rowSizeBytes - ((long) currentPixelInRow << 2);
+                nativePixelSegment.asSlice(writeOffset, remainingBytes).fill((byte) 0xFF); // 白パディング
+                commitRow();
+            }
+
+            // フレームの残余行があればパディングして最終フラッシュ
             if (currentRowInFrame > 0) {
                 if (currentRowInFrame < imgHeight) {
-                    long offsetBytes = currentRowInFrame * alignedRowBytes;
+                    long offsetBytes = (long) currentRowInFrame * alignedRowBytes;
                     long lengthBytes = (imgHeight - currentRowInFrame) * alignedRowBytes;
                     nativePixelSegment.asSlice(offsetBytes, lengthBytes).fill(PADDING_BYTE);
                 }
