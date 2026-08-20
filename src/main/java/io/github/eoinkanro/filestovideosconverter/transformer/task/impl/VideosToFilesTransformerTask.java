@@ -3,7 +3,6 @@ package io.github.eoinkanro.filestovideosconverter.transformer.task.impl;
 import io.github.eoinkanro.filestovideosconverter.transformer.TransformException;
 import io.github.eoinkanro.filestovideosconverter.transformer.task.TransformerTask;
 import lombok.extern.log4j.Log4j2;
-import org.bytedeco.javacv.FFmpegFrameFilter;
 import org.bytedeco.javacv.FFmpegFrameGrabber;
 import org.bytedeco.javacv.Frame;
 
@@ -17,18 +16,14 @@ import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.
 @Log4j2
 public class VideosToFilesTransformerTask extends TransformerTask {
 
-    private static final int RGB_CHANNELS = 3;
     private static final int OUTPUT_BUFFER_SIZE = 128 * 1024;
-    
-    private static final int UNROLL_PIXELS = 32;
-    private static final int UNROLL_BYTES = UNROLL_PIXELS * RGB_CHANNELS; // 96 Bytes
+    private static final int BULK_ZERO_BUFFER_SIZE = 16384;
 
-    private final byte[] bulkZeroBuffer = new byte[16384];
-    private final int[] extractedBitsBuffer = new int[UNROLL_PIXELS];
+    private final byte[] bulkZeroBuffer = new byte[BULK_ZERO_BUFFER_SIZE];
+    private final byte[] fileOutputBuffer = new byte[65536]; // 64KB 高速一括フラッシュバッファ
+    private int fileOutputBufferIdx = 0;
 
     private int duplicateFactor;
-    private int imageWidth;
-
     private int currentBitsCount;
     private int currentByteVal;
     private long zeroBytesCount;
@@ -56,16 +51,23 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             currentBitsCount = 0;
             currentByteVal = 0;
             zeroBytesCount = 0;
+            fileOutputBufferIdx = 0;
 
-            processFile(processData, outputStream);
+            // 【最適化】フィルターを完全撤廃し、HW直結 NV12 Yプレーンを直接処理
+            processFileDirectNV12(processData, outputStream);
 
+            // 残余ビットのフラッシュ
             if (currentBitsCount > 0) {
                 currentByteVal <<= (8 - currentBitsCount);
-                appendByteToStream(currentByteVal, outputStream);
+                appendByteToBuffer(currentByteVal, outputStream);
                 currentByteVal = 0;
                 currentBitsCount = 0;
             }
 
+            // バッファに残っているデータをフラッシュ
+            flushOutputBuffer(outputStream);
+
+            // ファイル末尾のゼロバイト復元
             int lastZeroBytesCount = fileUtils.getImageLastZeroBytesCount(processData.getAbsolutePath());
             if (lastZeroBytesCount > 0) {
                 writeZeroBytesWithCount(lastZeroBytesCount, outputStream);
@@ -81,138 +83,124 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         log.info("File {} was processed successfully", processData);
     }
 
-    private void processFile(File video, OutputStream outputStream) throws IOException {
-    try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
-        
-        // 1. HWデコーダのネイティブ出力フォーマット(NV12)を指定
-        grabber.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_NV12);
-        
-        // 2. 正しいJavaCV APIでVideoToolboxを指定
-        grabber.setVideoOption("hwaccel", "videotoolbox");
+    /**
+     * M4 VideoToolbox HWデコーダ直結 (NV12 Yプレーンダイレクトスキャン)
+     */
+    private void processFileDirectNV12(File video, OutputStream outputStream) throws Exception {
+        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(video)) {
+            // M4 ハードウェアデコーダを指定
+            grabber.setVideoOption("hwaccel", "videotoolbox");
+            grabber.setPixelFormat(org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_NV12);
+            grabber.start();
 
-        grabber.start();
-
-        // 3. Filterで NV12 -> RGB24 へ変換
-        try (FFmpegFrameFilter filter = new FFmpegFrameFilter("format=rgb24", grabber.getImageWidth(), grabber.getImageHeight())) {
-            filter.start();
-            processFile(grabber, filter, outputStream);
-        }
-    }
-}
-
-    private void processFile(FFmpegFrameGrabber grabber, FFmpegFrameFilter filter, OutputStream outputStream) throws IOException {
-        Frame frame;
-        while ((frame = grabber.grabFrame()) != null) {
-            imageWidth = frame.imageWidth;
-
-            filter.push(frame);
-            frame = filter.pull();
-
-            if (frame.type != null) {
-                continue;
-            }
-
-            int rowStride = frame.imageStride;
-            ByteBuffer nativeBuffer = (ByteBuffer) frame.image[0];
-            MemorySegment segment = MemorySegment.ofBuffer(nativeBuffer);
-
-            processImageLimitFFM(segment, frame.imageHeight, rowStride, outputStream);
-
-            taskStatistics.poll();
-        }
-    }
-
-    private void processImageLimitFFM(MemorySegment segment, int imageHeight, int rowStride, OutputStream outputStream) throws IOException {
-        final int df = duplicateFactor;
-        final int width = imageWidth;
-
-        // FAST PATH: Row-based Cache-Aligned Iteration (df == 1)
-        if (df == 1) {
-            final int activeRowBytes = width * RGB_CHANNELS;
-            final int unrollLimitBytes = activeRowBytes - (activeRowBytes % UNROLL_BYTES);
-
-            for (int y = 0; y < imageHeight; y++) {
-                final long rowBaseAddr = (long) y * rowStride;
-                long addr = rowBaseAddr;
-                final long unrollEndAddr = rowBaseAddr + unrollLimitBytes;
-
-                for (; addr < unrollEndAddr; addr += UNROLL_BYTES) {
-                    for (int p = 0; p < UNROLL_PIXELS; p++) {
-                        long pxAddr = addr + (p * RGB_CHANNELS);
-                        byte r = segment.get(ValueLayout.JAVA_BYTE, pxAddr);
-                        byte g = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 1);
-                        byte b = segment.get(ValueLayout.JAVA_BYTE, pxAddr + 2);
-
-                        int pBit = bytesUtils.pixelToBit(r, g, b);
-                        extractedBitsBuffer[p] = bytesUtils.pixelToBit(pBit, 1);
-                    }
-
-                    for (int p = 0; p < UNROLL_PIXELS; p++) {
-                        processSingleBit(extractedBitsBuffer[p], outputStream);
-                    }
+            Frame frame;
+            while ((frame = grabber.grabImage()) != null) {
+                if (frame.image == null || frame.image[0] == null) {
+                    continue;
                 }
 
-                final long activeEndAddr = rowBaseAddr + activeRowBytes;
-                for (; addr < activeEndAddr; addr += RGB_CHANNELS) {
-                    byte r = segment.get(ValueLayout.JAVA_BYTE, addr);
-                    byte g = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
-                    byte b = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
+                int imageWidth = frame.imageWidth;
+                int imageHeight = frame.imageHeight;
+                int rowStride = frame.imageStride; // 128B アライメントストライド
 
-                    int pBit = bytesUtils.pixelToBit(r, g, b);
-                    int bit = bytesUtils.pixelToBit(pBit, 1);
+                ByteBuffer nativeBuffer = (ByteBuffer) frame.image[0];
+                MemorySegment yPlaneSegment = MemorySegment.ofBuffer(nativeBuffer);
+
+                // Yプレーン(グレースケール輝度)をダイレクトに高速二値化
+                decodeYPlane(yPlaneSegment, imageWidth, imageHeight, rowStride, outputStream);
+
+                taskStatistics.poll();
+            }
+        }
+    }
+
+    /**
+     * グレースケール輝度 Yプレーンの二値化デコード
+     */
+    private void decodeYPlane(MemorySegment segment, int width, int height, int rowStride, OutputStream outputStream) throws IOException {
+        final int df = duplicateFactor;
+
+        // =========================================================================
+        // FAST PATH: duplicateFactor == 1 (1ピクセル = 1ビット)
+        // =========================================================================
+        if (df == 1) {
+            for (int y = 0; y < height; y++) {
+                long rowAddr = (long) y * rowStride;
+                int x = 0;
+
+                // 8ピクセル (8バイト) 単位で一括アンローリング
+                for (; x <= width - 8; x += 8) {
+                    long addr = rowAddr + x;
+                    // Y < 128 なら黒(1)、Y >= 128 なら白(0)
+                    // Javaの符号付きbyteにおいて 0〜127(黒寄り)は >= 0、128〜255(白寄り)は < 0
+                    int b0 = segment.get(ValueLayout.JAVA_BYTE, addr)     >= 0 ? 1 : 0;
+                    int b1 = segment.get(ValueLayout.JAVA_BYTE, addr + 1) >= 0 ? 1 : 0;
+                    int b2 = segment.get(ValueLayout.JAVA_BYTE, addr + 2) >= 0 ? 1 : 0;
+                    int b3 = segment.get(ValueLayout.JAVA_BYTE, addr + 3) >= 0 ? 1 : 0;
+                    int b4 = segment.get(ValueLayout.JAVA_BYTE, addr + 4) >= 0 ? 1 : 0;
+                    int b5 = segment.get(ValueLayout.JAVA_BYTE, addr + 5) >= 0 ? 1 : 0;
+                    int b6 = segment.get(ValueLayout.JAVA_BYTE, addr + 6) >= 0 ? 1 : 0;
+                    int b7 = segment.get(ValueLayout.JAVA_BYTE, addr + 7) >= 0 ? 1 : 0;
+
+                    int byteVal = (b0 << 7) | (b1 << 6) | (b2 << 5) | (b3 << 4)
+                                | (b4 << 3) | (b5 << 2) | (b6 << 1) | b7;
+
+                    appendByteToBuffer(byteVal, outputStream);
+                }
+
+                // 端数ピクセル処理
+                for (; x < width; x++) {
+                    int bit = segment.get(ValueLayout.JAVA_BYTE, rowAddr + x) >= 0 ? 1 : 0;
                     processSingleBit(bit, outputStream);
                 }
             }
             return;
         }
 
-        // SLOW PATH: Block-based Iteration (df > 1)
-        final int blockRows = imageHeight / df;
+        // =========================================================================
+        // SLOW PATH: duplicateFactor > 1 (耐圧縮ブロック平均化)
+        // =========================================================================
+        final int blockRows = height / df;
         final int bitsPerRow = width / df;
-
-        final int colByteStride = df * RGB_CHANNELS;
         final int blockRowStride = df * rowStride;
+        // しきい値: ピクセル数 * 128 (Limited Range 16〜235 でも完全中央)
+        final int threshold = df * df * 128;
 
         for (int i = 0; i < blockRows; i++) {
             final long blockStartByte = (long) i * blockRowStride;
 
             for (int b = 0; b < bitsPerRow; b++) {
-                final long colByte = (long) b * colByteStride;
-                int pixelSum = 0;
+                final long colOffset = (long) b * df;
+                int ySum = 0;
 
-                long rowAddr = blockStartByte + colByte;
+                long rowAddr = blockStartByte + colOffset;
                 for (int r = 0; r < df; r++) {
                     long addr = rowAddr;
                     for (int c = 0; c < df; c++) {
-                        byte red = segment.get(ValueLayout.JAVA_BYTE, addr);
-                        byte green = segment.get(ValueLayout.JAVA_BYTE, addr + 1);
-                        byte blue = segment.get(ValueLayout.JAVA_BYTE, addr + 2);
-
-                        pixelSum += bytesUtils.pixelToBit(red, green, blue);
-                        addr += RGB_CHANNELS;
+                        // 符号なし 8-bit 輝度値 (0〜255) を加算
+                        ySum += (segment.get(ValueLayout.JAVA_BYTE, addr) & 0xFF);
+                        addr++;
                     }
                     rowAddr += rowStride;
                 }
 
-                int bit = bytesUtils.pixelToBit(pixelSum, df);
+                // 合計輝度がしきい値未満なら黒(1)、以上なら白(0)
+                int bit = (ySum < threshold) ? 1 : 0;
                 processSingleBit(bit, outputStream);
             }
         }
     }
 
     private void processSingleBit(int bit, OutputStream outputStream) throws IOException {
-        if (bit >= 0) {
-            currentByteVal = (currentByteVal << 1) | bit;
-
-            if (++currentBitsCount == 8) {
-                appendByteToStream(currentByteVal, outputStream);
-                currentByteVal = 0;
-                currentBitsCount = 0;
-            }
+        currentByteVal = (currentByteVal << 1) | bit;
+        if (++currentBitsCount == 8) {
+            appendByteToBuffer(currentByteVal, outputStream);
+            currentByteVal = 0;
+            currentBitsCount = 0;
         }
     }
 
-    private void appendByteToStream(int byteVal, OutputStream outputStream) throws IOException {
+    private void appendByteToBuffer(int byteVal, OutputStream outputStream) throws IOException {
         if (byteVal == 0) {
             zeroBytesCount++;
             return;
@@ -221,10 +209,22 @@ public class VideosToFilesTransformerTask extends TransformerTask {
             writeZeroBytesWithCount(zeroBytesCount, outputStream);
             zeroBytesCount = 0;
         }
-        outputStream.write(byteVal);
+
+        fileOutputBuffer[fileOutputBufferIdx++] = (byte) byteVal;
+        if (fileOutputBufferIdx == fileOutputBuffer.length) {
+            flushOutputBuffer(outputStream);
+        }
+    }
+
+    private void flushOutputBuffer(OutputStream outputStream) throws IOException {
+        if (fileOutputBufferIdx > 0) {
+            outputStream.write(fileOutputBuffer, 0, fileOutputBufferIdx);
+            fileOutputBufferIdx = 0;
+        }
     }
 
     private void writeZeroBytesWithCount(long count, OutputStream outputStream) throws IOException {
+        flushOutputBuffer(outputStream);
         long remaining = count;
         final int bufferLength = bulkZeroBuffer.length;
 
