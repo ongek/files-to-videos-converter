@@ -19,6 +19,10 @@ public final class InputCLIArguments {
     public static final InputCLIArgument<Integer> DUPLICATE_FACTOR = new InputCLIArgument<>("df", "duplicateFactor", true,
             "Duplicate factor of pixel per bit. Example: 4, then bit = square of 16 pixels total. Default: 4", 4);
 
+    // 【追加】動画の圧縮品質 (0〜100、デフォルト 50)
+    public static final InputCLIArgument<Integer> VIDEO_QUALITY = new InputCLIArgument<>("vq", "videoQuality", true,
+            "Quality of generated video (0-100). Lower is smaller size, higher is better quality. Default: 50", 50);
+
     public static final InputCLIArgument<Boolean> VIDEOS_TO_FILES = new InputCLIArgument<>("vtf", "videosToFiles", false, "Transform images to files", false);
 
     public static final InputCLIArgument<String> VIDEOS_PATH = new InputCLIArgument<>("vp", "videosPath", true,
