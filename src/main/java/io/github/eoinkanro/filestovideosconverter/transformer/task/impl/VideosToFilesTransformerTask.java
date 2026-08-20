@@ -22,10 +22,8 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     private static final long SIGN_BIT_MASK_64 = 0x8080808080808080L;
 
     private final byte[] bulkZeroBuffer = new byte[BULK_ZERO_BUFFER_SIZE];
-    private final byte[] fileOutputBuffer = new byte[65536]; // 64KB 高速一括フラッシュバッファ
+    private final byte[] fileOutputBuffer = new byte[OUTPUT_BUFFER_SIZE]; // 128KB 高速一括フラッシュバッファ
     private int fileOutputBufferIdx = 0;
-
-    private int[] blockRowAccumulator; // 横方向連続スキャン用ラインバッファ
 
     private int duplicateFactor;
     private int currentBitsCount;
@@ -100,12 +98,12 @@ public class VideosToFilesTransformerTask extends TransformerTask {
 
                 int imageWidth = frame.imageWidth;
                 int imageHeight = frame.imageHeight;
-                int rowStride = frame.imageStride;
+                int rowStride = frame.imageStride; // 128B アライメントストライド
 
                 ByteBuffer nativeBuffer = (ByteBuffer) frame.image[0];
                 MemorySegment yPlaneSegment = MemorySegment.ofBuffer(nativeBuffer);
 
-                decodeYPlaneFast(yPlaneSegment, imageWidth, imageHeight, rowStride, outputStream);
+                decodeYPlaneBlitz(yPlaneSegment, imageWidth, imageHeight, rowStride, outputStream);
 
                 taskStatistics.poll();
             }
@@ -113,30 +111,28 @@ public class VideosToFilesTransformerTask extends TransformerTask {
     }
 
     /**
-     * キャッシュライン最適化 ＆ Java 26 ビット抽出による超高速 Y プレーンデコード
+     * 【M4 Blitz Decoder】
+     * 中間配列を完全全廃し、レジスタ内で 4行を同時合算して 1 バイトを生成する極限デコーダ
      */
-    private void decodeYPlaneFast(MemorySegment segment, int width, int height, int rowStride, OutputStream outputStream) throws IOException {
+    private void decodeYPlaneBlitz(MemorySegment segment, int width, int height, int rowStride, OutputStream outputStream) throws IOException {
         final int df = duplicateFactor;
 
         // =========================================================================
-        // FAST PATH: duplicateFactor == 1 (Java 26 Long.compress による 1 命令抽出)
+        // 【FAST PATH: df == 1】Java 26 Long.compress による 1 命令抽出
         // =========================================================================
         if (df == 1) {
             for (int y = 0; y < height; y++) {
                 long rowAddr = (long) y * rowStride;
                 int x = 0;
 
-                // 8ピクセル (64bit) を一括ロードして 1 命令で 1 バイトへ圧縮
                 for (; x <= width - 8; x += 8) {
                     long raw8 = segment.get(ValueLayout.JAVA_LONG_UNALIGNED, rowAddr + x);
-                    // 輝度 < 128 (黒=1) の最上位ビットを抽出し、Little-Endian 順序を反転して 1 バイト化
                     long compressedBits = Long.compress(~raw8, SIGN_BIT_MASK_64);
                     int byteVal = Integer.reverse((int) compressedBits) >>> 24;
 
                     appendByteToBuffer(byteVal, outputStream);
                 }
 
-                // 端数ピクセル
                 for (; x < width; x++) {
                     int bit = segment.get(ValueLayout.JAVA_BYTE, rowAddr + x) >= 0 ? 1 : 0;
                     processSingleBit(bit, outputStream);
@@ -146,68 +142,88 @@ public class VideosToFilesTransformerTask extends TransformerTask {
         }
 
         // =========================================================================
-        // HIGH-SPEED PATH: duplicateFactor > 1 (キャッシュライン横方向連続集約)
+        // 【M4 ULTRA FAST PATH: df == 4】
+        // 中間配列ゼロ！4行の 32バイト(8ブロック)をレジスタで一発合算して 1バイト直書き
+        // =========================================================================
+        if (df == 4) {
+            final int blockRows = height >> 2;   // / 4
+            final int blockRowStride = rowStride << 2; // * 4
+            final int threshold = 4 * 4 * 128; // 2048 (耐再エンコード完全中央しきい値)
+
+            for (int i = 0; i < blockRows; i++) {
+                long addr0 = (long) i * blockRowStride;
+                long addr1 = addr0 + rowStride;
+                long addr2 = addr1 + rowStride;
+                long addr3 = addr2 + rowStride;
+
+                int x = 0;
+                // 8ブロック (横 32 ピクセル) ごとに 1 バイトを一撃生成
+                for (; x <= width - 32; x += 32) {
+                    // ブロック 0〜7 の 16ピクセル(4x4)をレジスタ内で完全並列合算
+                    int s0 = sum4(segment, addr0 + x)      + sum4(segment, addr1 + x)      + sum4(segment, addr2 + x)      + sum4(segment, addr3 + x);
+                    int s1 = sum4(segment, addr0 + x + 4)  + sum4(segment, addr1 + x + 4)  + sum4(segment, addr2 + x + 4)  + sum4(segment, addr3 + x + 4);
+                    int s2 = sum4(segment, addr0 + x + 8)  + sum4(segment, addr1 + x + 8)  + sum4(segment, addr2 + x + 8)  + sum4(segment, addr3 + x + 8);
+                    int s3 = sum4(segment, addr0 + x + 12) + sum4(segment, addr1 + x + 12) + sum4(segment, addr2 + x + 12) + sum4(segment, addr3 + x + 12);
+                    int s4 = sum4(segment, addr0 + x + 16) + sum4(segment, addr1 + x + 16) + sum4(segment, addr2 + x + 16) + sum4(segment, addr3 + x + 16);
+                    int s5 = sum4(segment, addr0 + x + 20) + sum4(segment, addr1 + x + 20) + sum4(segment, addr2 + x + 20) + sum4(segment, addr3 + x + 20);
+                    int s6 = sum4(segment, addr0 + x + 24) + sum4(segment, addr1 + x + 24) + sum4(segment, addr2 + x + 24) + sum4(segment, addr3 + x + 24);
+                    int s7 = sum4(segment, addr0 + x + 28) + sum4(segment, addr1 + x + 28) + sum4(segment, addr2 + x + 28) + sum4(segment, addr3 + x + 28);
+
+                    // AArch64 CSET による完全 Branchless バイト合成
+                    int byteVal = ((s0 < threshold ? 1 : 0) << 7)
+                                | ((s1 < threshold ? 1 : 0) << 6)
+                                | ((s2 < threshold ? 1 : 0) << 5)
+                                | ((s3 < threshold ? 1 : 0) << 4)
+                                | ((s4 < threshold ? 1 : 0) << 3)
+                                | ((s5 < threshold ? 1 : 0) << 2)
+                                | ((s6 < threshold ? 1 : 0) << 1)
+                                |  (s7 < threshold ? 1 : 0);
+
+                    appendByteToBuffer(byteVal, outputStream);
+                }
+
+                // 端数ブロック (存在する場合)
+                for (; x < width; x += 4) {
+                    int s = sum4(segment, addr0 + x) + sum4(segment, addr1 + x) + sum4(segment, addr2 + x) + sum4(segment, addr3 + x);
+                    processSingleBit(s < threshold ? 1 : 0, outputStream);
+                }
+            }
+            return;
+        }
+
+        // =========================================================================
+        // 【汎用 PATH: 任意の df】
         // =========================================================================
         final int bitsPerRow = width / df;
         final int blockRows = height / df;
-        final int threshold = df * df * 128; // 耐再エンコード完全中央しきい値
-
-        if (blockRowAccumulator == null || blockRowAccumulator.length < bitsPerRow) {
-            blockRowAccumulator = new int[bitsPerRow];
-        }
+        final int blockRowStride = df * rowStride;
+        final int threshold = df * df * 128;
 
         for (int i = 0; i < blockRows; i++) {
-            long blockRowStartAddr = (long) i * df * rowStride;
-            Arrays.fill(blockRowAccumulator, 0, bitsPerRow, 0);
+            long blockRowStartAddr = (long) i * blockRowStride;
 
-            // 【M4 キャッシュ最適化】df 本の行を完全にシーケンシャル（横方向）にスキャン
-            for (int r = 0; r < df; r++) {
-                long currentRowAddr = blockRowStartAddr + (long) r * rowStride;
+            for (int b = 0; b < bitsPerRow; b++) {
+                long colOffset = (long) b * df;
+                int ySum = 0;
 
-                if (df == 4) {
-                    // df == 4 特化: 32bit 一括ロードで 4画素をまとめて加算
-                    for (int b = 0; b < bitsPerRow; b++) {
-                        int raw4 = segment.get(ValueLayout.JAVA_INT_UNALIGNED, currentRowAddr + (b << 2));
-                        int sum4 = (raw4 & 0xFF) + ((raw4 >>> 8) & 0xFF) + ((raw4 >>> 16) & 0xFF) + ((raw4 >>> 24) & 0xFF);
-                        blockRowAccumulator[b] += sum4;
-                    }
-                } else {
-                    // 汎用 df パス
-                    for (int b = 0; b < bitsPerRow; b++) {
-                        long addr = currentRowAddr + (long) b * df;
-                        int rowSum = 0;
-                        for (int c = 0; c < df; c++) {
-                            rowSum += (segment.get(ValueLayout.JAVA_BYTE, addr + c) & 0xFF);
-                        }
-                        blockRowAccumulator[b] += rowSum;
+                for (int r = 0; r < df; r++) {
+                    long rowAddr = blockRowStartAddr + (long) r * rowStride + colOffset;
+                    for (int c = 0; c < df; c++) {
+                        ySum += (segment.get(ValueLayout.JAVA_BYTE, rowAddr + c) & 0xFF);
                     }
                 }
-            }
 
-            // 【8ビット一括パック】1行分のブロックから 8個ずつまとめて 1 バイトを生成 (分岐ゼロ)
-            int b = 0;
-            for (; b <= bitsPerRow - 8; b += 8) {
-                int b0 = blockRowAccumulator[b]     < threshold ? 1 : 0;
-                int b1 = blockRowAccumulator[b + 1] < threshold ? 1 : 0;
-                int b2 = blockRowAccumulator[b + 2] < threshold ? 1 : 0;
-                int b3 = blockRowAccumulator[b + 3] < threshold ? 1 : 0;
-                int b4 = blockRowAccumulator[b + 4] < threshold ? 1 : 0;
-                int b5 = blockRowAccumulator[b + 5] < threshold ? 1 : 0;
-                int b6 = blockRowAccumulator[b + 6] < threshold ? 1 : 0;
-                int b7 = blockRowAccumulator[b + 7] < threshold ? 1 : 0;
-
-                int byteVal = (b0 << 7) | (b1 << 6) | (b2 << 5) | (b3 << 4)
-                            | (b4 << 3) | (b5 << 2) | (b6 << 1) | b7;
-
-                appendByteToBuffer(byteVal, outputStream);
-            }
-
-            // 端数ブロック
-            for (; b < bitsPerRow; b++) {
-                int bit = blockRowAccumulator[b] < threshold ? 1 : 0;
-                processSingleBit(bit, outputStream);
+                processSingleBit(ySum < threshold ? 1 : 0, outputStream);
             }
         }
+    }
+
+    /**
+     * 【M4 SWAR 4画素加算】32-bit (4バイト) を一括ロードして 4画素の輝度を瞬時に合算
+     */
+    private static int sum4(MemorySegment segment, long addr) {
+        int raw4 = segment.get(ValueLayout.JAVA_INT_UNALIGNED, addr);
+        return (raw4 & 0xFF) + ((raw4 >>> 8) & 0xFF) + ((raw4 >>> 16) & 0xFF) + ((raw4 >>> 24) & 0xFF);
     }
 
     private void processSingleBit(int bit, OutputStream outputStream) throws IOException {
