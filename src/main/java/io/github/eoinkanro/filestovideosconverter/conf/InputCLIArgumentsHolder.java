@@ -20,11 +20,12 @@ public class InputCLIArgumentsHolder {
     public boolean init(String... args) throws Exception {
         Options options = new Options();
         for (Field field : InputCLIArguments.class.getDeclaredFields()) {
-            InputCLIArgument<?> inputCLIArgument = (InputCLIArgument<?>) field.get(InputCLIArguments.class);
-            options.addOption(inputCLIArgument.getShortName(),
-                    inputCLIArgument.getFullName(),
-                    inputCLIArgument.isHasArg(),
-                    inputCLIArgument.getDescription());
+            if (field.get(null) instanceof InputCLIArgument<?> inputCLIArgument) {
+                options.addOption(inputCLIArgument.getShortName(),
+                        inputCLIArgument.getFullName(),
+                        inputCLIArgument.isHasArg(),
+                        inputCLIArgument.getDescription());
+            }
         }
 
         if (args.length == 0) {
@@ -55,14 +56,11 @@ public class InputCLIArgumentsHolder {
             return inputCLIArgument.getAssignedValue();
         }
 
-        T cliValue;
-        if (inputCLIArgument.getDefaultValue() instanceof Boolean) {
-            cliValue = cmd.hasOption(inputCLIArgument.getShortName()) ? (T) Boolean.TRUE : (T) Boolean.FALSE;
-        } else if (inputCLIArgument.getDefaultValue() instanceof String) {
-            cliValue = (T) cmd.getOptionValue(inputCLIArgument.getShortName());
-        } else {
-            cliValue = (T) castArgumentToInt(inputCLIArgument);
-        }
+        T cliValue = switch (inputCLIArgument.getDefaultValue()) {
+            case Boolean b -> (T) Boolean.valueOf(cmd.hasOption(inputCLIArgument.getShortName()));
+            case String s  -> (T) cmd.getOptionValue(inputCLIArgument.getShortName());
+            case null, default -> (T) castArgumentToInt(inputCLIArgument);
+        };
 
         if (cliValue == null) {
             inputCLIArgument.setAssignedValue(inputCLIArgument.getDefaultValue());
@@ -74,15 +72,17 @@ public class InputCLIArgumentsHolder {
     }
 
     private <T> Integer castArgumentToInt(InputCLIArgument<T> inputCLIArgument) {
-        Integer result = null;
+        String optionVal = cmd.getOptionValue(inputCLIArgument.getShortName());
+        if (optionVal == null) {
+            return null;
+        }
         try {
-            result = Integer.parseInt(cmd.getOptionValue(inputCLIArgument.getShortName()));
+            return Integer.parseInt(optionVal);
         } catch (NumberFormatException e) {
             if (log.isDebugEnabled()) {
-                log.debug("Can't cast {} of {}", cmd.getOptionValue(inputCLIArgument.getShortName()), inputCLIArgument);
+                log.debug("Can't cast {} of {}", optionVal, inputCLIArgument);
             }
+            return null;
         }
-        return result;
     }
-
 }
