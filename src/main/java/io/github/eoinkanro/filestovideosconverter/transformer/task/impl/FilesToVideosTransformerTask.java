@@ -2,6 +2,7 @@ package io.github.eoinkanro.filestovideosconverter.transformer.task.impl;
 
 import io.github.eoinkanro.filestovideosconverter.transformer.TransformException;
 import io.github.eoinkanro.filestovideosconverter.transformer.task.TransformerTask;
+import io.github.eoinkanro.filestovideosconverter.utils.BytesUtils;
 import lombok.extern.log4j.Log4j2;
 import org.bytedeco.javacv.FFmpegFrameRecorder;
 import org.bytedeco.javacv.Frame;
@@ -15,6 +16,7 @@ import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
 
+// 【追加】VIDEO_QUALITY をインポート
 import static io.github.eoinkanro.filestovideosconverter.conf.InputCLIArguments.*;
 import static io.github.eoinkanro.filestovideosconverter.utils.BytesUtils.ZERO;
 import static org.bytedeco.ffmpeg.global.avutil.AV_PIX_FMT_RGBA;
@@ -46,7 +48,8 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         final long alignedRowBytes = (rawRowBytes + (M4_CACHE_LINE_ALIGNMENT - 1)) & ~(M4_CACHE_LINE_ALIGNMENT - 1);
         final long totalFrameBytes = alignedRowBytes * imgHeight;
 
-        final int[] bitToPixelFlatLut = buildBitToPixelFlatLut();
+        // BytesUtils の定数 LUT を直接使用 (毎回のメモリ割り当てゼロ)
+        final int[] bitToPixelFlatLut = BytesUtils.BIT_TO_PIXEL_FLAT_LUT;
 
         File resultVideoFile = null;
 
@@ -71,8 +74,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
                 while ((bytesRead = inputStream.read(readBuffer)) >= 0) {
                     for (int i = 0; i < bytesRead; i++) {
-                        // 【M4 SIMD最適化】System.arraycopy を廃止し、NEON レジスタ展開を誘発
-                        final int lutOffset = (readBuffer[i] & 0xFF) << 3; // * 8
+                        final int lutOffset = (readBuffer[i] & 0xFF) << 3;
                         localTempRow[localTempRowIndex]     = bitToPixelFlatLut[lutOffset];
                         localTempRow[localTempRowIndex + 1] = bitToPixelFlatLut[lutOffset + 1];
                         localTempRow[localTempRowIndex + 2] = bitToPixelFlatLut[lutOffset + 2];
@@ -120,8 +122,10 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         recorder.setVideoCodecName(activeCodec);
         recorder.setPixelFormat(AV_PIX_FMT_YUV420P);
 
+        // 【修正】CLI 引数 (-vq, --videoQuality) から動的に品質を取得して設定
+        final int videoQuality = inputCLIArgumentsHolder.getArgument(VIDEO_QUALITY);
         recorder.setVideoBitrate(0);
-        recorder.setVideoQuality(50);
+        recorder.setVideoQuality(videoQuality);
 
         if ("hevc_videotoolbox".equals(activeCodec)) {
             recorder.setVideoOption("prio_speed", "0");
@@ -136,37 +140,20 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         return recorder;
     }
 
-    private int[] buildBitToPixelFlatLut() {
-        final int[] lut = new int[256 * 8];
-        final int pixelZero = bytesUtils.bitToPixel(0);
-        final int pixelOne  = bytesUtils.bitToPixel(1);
-
-        for (int b = 0; b < 256; b++) {
-            for (int bit = 0; bit < 8; bit++) {
-                lut[(b << 3) + bit] = ((b & (1 << (7 - bit))) != 0) ? pixelOne : pixelZero;
-            }
-        }
-        return lut;
-    }
-
-    /**
-     * 安全な Arena 管理によるゼロコピー FourCC パッチ ('hev1' -> 'hvc1')
-     */
     private void convertHev1ToHvc1Fast(File mp4File) {
         if (mp4File == null || !mp4File.exists()) return;
 
         final long searchLimit = Math.min(mp4File.length(), 2 * 1024 * 1024L);
-        // 【修正】Arena を try-with-resources で明示管理してリソースリークを完全防止
         try (RandomAccessFile raf = new RandomAccessFile(mp4File, "rw");
              FileChannel channel = raf.getChannel();
              Arena mmapArena = Arena.ofConfined()) {
 
             MemorySegment segment = channel.map(FileChannel.MapMode.READ_WRITE, 0, searchLimit, mmapArena);
             for (long i = 0; i <= searchLimit - 4; i++) {
-                if (segment.get(ValueLayout.JAVA_BYTE, i)     == 0x68 && // 'h'
-                    segment.get(ValueLayout.JAVA_BYTE, i + 1) == 0x65 && // 'e'
-                    segment.get(ValueLayout.JAVA_BYTE, i + 2) == 0x76 && // 'v'
-                    segment.get(ValueLayout.JAVA_BYTE, i + 3) == 0x31) { // '1'
+                if (segment.get(ValueLayout.JAVA_BYTE, i)     == 0x68 &&
+                    segment.get(ValueLayout.JAVA_BYTE, i + 1) == 0x65 &&
+                    segment.get(ValueLayout.JAVA_BYTE, i + 2) == 0x76 &&
+                    segment.get(ValueLayout.JAVA_BYTE, i + 3) == 0x31) {
 
                     segment.set(ValueLayout.JAVA_BYTE, i + 1, (byte) 'v');
                     segment.set(ValueLayout.JAVA_BYTE, i + 2, (byte) 'c');
@@ -179,12 +166,9 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         }
     }
 
-    /**
-     * 高速ネイティブフレーム制御クラス (static化 & ゼロ無駄アロケーション)
-     */
     private static class NativeFrameWriter {
         private final FFmpegFrameRecorder videoRecorder;
-        private final Object taskStatistics; // 呼び出し用統計インスタンス
+        private final Object taskStatistics;
         private final int imgWidth;
         private final int imgHeight;
         private final int duplicateFactor;
@@ -203,7 +187,6 @@ public class FilesToVideosTransformerTask extends TransformerTask {
             this.imgHeight = imgHeight;
             this.duplicateFactor = duplicateFactor;
             this.alignedRowBytes = alignedRowBytes;
-            // df == 1 の時は無駄な配列アロケーションを抑止
             this.localRowCache = (duplicateFactor > 1) ? new int[imgWidth] : null;
 
             this.nativePixelSegment = arena.allocate(totalFrameBytes, M4_CACHE_LINE_ALIGNMENT);
