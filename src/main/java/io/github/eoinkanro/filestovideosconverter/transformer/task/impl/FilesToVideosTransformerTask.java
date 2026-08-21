@@ -133,8 +133,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         recorder.setVideoQuality(videoQuality);
 
         if ("hevc_videotoolbox".equals(activeCodec)) {
-            // 【HW速度ブースト】M4 メディアエンジンの速度優先モード (待機時間を短縮)
-            recorder.setVideoOption("prio_speed", "1");
+            recorder.setVideoOption("prio_speed", "0");
             recorder.setVideoOption("power_efficient", "0");
             recorder.setVideoOption("realtime", "0");
             recorder.setVideoOption("spatial_aq", "0");
