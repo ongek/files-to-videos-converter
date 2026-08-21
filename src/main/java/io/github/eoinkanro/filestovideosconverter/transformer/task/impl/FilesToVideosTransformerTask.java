@@ -24,24 +24,20 @@ public class FilesToVideosTransformerTask extends TransformerTask {
     private static final byte PADDING_BYTE = (byte) 0xFF; // 白パディング (Y=255)
 
     // 【YUV420P 直結 LUT (8KB)】1バイト -> 横32画素の Y プレーン (32 bytes = 4 long)
-    // RGBA (128B) から Y (32B) に激減し、sws_scale を完全抹消
     private static final long[] DF4_Y_PLANE_LUT = new long[256 * 4];
 
     static {
-        // 白: Y=255 (0xFFFFFFFFFFFFFFFFL), 黒: Y=0 (0x0000000000000000L)
-        long blackQuad = 0x00000000_00000000L; // 黒4画素 (4 bytes = 32bit 0) -> 2つで 64bit
-        long whiteQuad = 0xFFFFFFFF_FFFFFFFFL; // 白4画素 (4 bytes = 32bit FF)
+        long blackQuad = 0x00000000_00000000L; // 黒4画素 (Y=0)
+        long whiteQuad = 0xFFFFFFFF_FFFFFFFFL; // 白4画素 (Y=255)
 
         for (int b = 0; b < 256; b++) {
-            int base = b << 2; // * 4
-            // 8 ビットを 32 バイト (4 long) に展開 (1ビット = 横4バイト)
+            int base = b << 2;
             for (int pair = 0; pair < 4; pair++) {
                 int bit0 = (b >> (7 - (pair * 2))) & 1;
                 int bit1 = (b >> (7 - (pair * 2 + 1))) & 1;
 
-                long val0 = (bit0 != 0) ? blackQuad : whiteQuad; // 4 bytes (下位32bit)
-                long val1 = (bit1 != 0) ? blackQuad : whiteQuad; // 4 bytes (上位32bit)
-                // Little-Endian で 8 bytes (8画素)
+                long val0 = (bit0 != 0) ? blackQuad : whiteQuad;
+                long val1 = (bit1 != 0) ? blackQuad : whiteQuad;
                 DF4_Y_PLANE_LUT[base + pair] = (val1 << 32) | (val0 & 0xFFFFFFFFL);
             }
         }
@@ -62,14 +58,14 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         final int imgHeight = inputCLIArgumentsHolder.getArgument(IMAGE_HEIGHT);
         final int duplicateFactor = inputCLIArgumentsHolder.getArgument(DUPLICATE_FACTOR);
 
-        // YUV420P の各プレーンサイズ計算 (128B アライメント)
+        // YUV420P の連続フレームサイズ計算 (128B アライメント)
         final long alignedRowBytesY = (imgWidth + (M4_CACHE_LINE_ALIGNMENT - 1)) & ~(M4_CACHE_LINE_ALIGNMENT - 1);
         final long yPlaneBytes = alignedRowBytesY * imgHeight;
         
-        final int uvWidth = imgWidth / 2;
         final int uvHeight = imgHeight / 2;
-        final long alignedRowBytesUV = (uvWidth + (M4_CACHE_LINE_ALIGNMENT - 1)) & ~(M4_CACHE_LINE_ALIGNMENT - 1);
+        final long alignedRowBytesUV = ((imgWidth / 2) + (M4_CACHE_LINE_ALIGNMENT - 1)) & ~(M4_CACHE_LINE_ALIGNMENT - 1);
         final long uvPlaneBytes = alignedRowBytesUV * uvHeight;
+        final long totalFrameBytes = yPlaneBytes + (uvPlaneBytes * 2); // 連続メモリ総サイズ
 
         File resultVideoFile = null;
 
@@ -88,10 +84,10 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
                 videoRecorder.start();
 
-                // YUV420P ダイレクトライター
-                final DirectYUV420PFrameWriter frameWriter = new DirectYUV420PFrameWriter(
+                // 連続 YUV420P バッファライター
+                final ContiguousYUV420PFrameWriter frameWriter = new ContiguousYUV420PFrameWriter(
                         arena, videoRecorder, taskStatistics, imgWidth, imgHeight, duplicateFactor,
-                        alignedRowBytesY, yPlaneBytes, alignedRowBytesUV, uvPlaneBytes
+                        alignedRowBytesY, yPlaneBytes, totalFrameBytes
                 );
 
                 final int bytesPerBlockRow = imgWidth / (duplicateFactor << 3); // df=4 なら 40B
@@ -137,7 +133,8 @@ public class FilesToVideosTransformerTask extends TransformerTask {
         recorder.setVideoQuality(videoQuality);
 
         if ("hevc_videotoolbox".equals(activeCodec)) {
-            recorder.setVideoOption("prio_speed", "0");
+            // 【HW速度ブースト】M4 メディアエンジンの速度優先モード (待機時間を短縮)
+            recorder.setVideoOption("prio_speed", "1");
             recorder.setVideoOption("power_efficient", "0");
             recorder.setVideoOption("realtime", "0");
             recorder.setVideoOption("spatial_aq", "0");
@@ -176,67 +173,64 @@ public class FilesToVideosTransformerTask extends TransformerTask {
     }
 
     /**
-     * 【Direct YUV420P Writer (sws_scale 完全バイパス)】
+     * 【連続 YUV420P バッファライター】
+     * 1つの連続メモリ領域に Y + U(128) + V(128) を配置し、完全な白黒を出力
      */
-    private static class DirectYUV420PFrameWriter {
+    private static class ContiguousYUV420PFrameWriter {
         private final FFmpegFrameRecorder videoRecorder;
         private final Object taskStatistics;
         private final int imgWidth;
         private final int imgHeight;
         private final int duplicateFactor;
         private final long alignedRowBytesY;
+        private final long yPlaneBytes;
         private final long rowSizeBytesY;
 
-        private final MemorySegment ySegment;
+        private final MemorySegment totalSegment;
         private final Frame reusableFrame;
 
         private int currentRowInFrame = 0;
         private int currentPixelInRow = 0;
 
-        public DirectYUV420PFrameWriter(Arena arena, FFmpegFrameRecorder videoRecorder,
-                                        Object taskStatistics, int imgWidth, int imgHeight,
-                                        int duplicateFactor, long alignedRowBytesY, long yPlaneBytes,
-                                        long alignedRowBytesUV, long uvPlaneBytes) {
+        public ContiguousYUV420PFrameWriter(Arena arena, FFmpegFrameRecorder videoRecorder,
+                                            Object taskStatistics, int imgWidth, int imgHeight,
+                                            int duplicateFactor, long alignedRowBytesY, long yPlaneBytes,
+                                            long totalFrameBytes) {
             this.videoRecorder = videoRecorder;
             this.taskStatistics = taskStatistics;
             this.imgWidth = imgWidth;
             this.imgHeight = imgHeight;
             this.duplicateFactor = duplicateFactor;
             this.alignedRowBytesY = alignedRowBytesY;
-            this.rowSizeBytesY = imgWidth; // Y プレーンは 1画素 1バイト
+            this.yPlaneBytes = yPlaneBytes;
+            this.rowSizeBytesY = imgWidth;
 
-            // 1. Y プレーンの確保
-            this.ySegment = arena.allocate(yPlaneBytes, M4_CACHE_LINE_ALIGNMENT);
+            // 1. Y + U + V の連続ネイティブメモリを 1 つ確保
+            this.totalSegment = arena.allocate(totalFrameBytes, M4_CACHE_LINE_ALIGNMENT);
 
-            // 2. U プレーン / V プレーンの確保 (白黒なので 128 (0x80) で一度だけ完全初期化)
-            MemorySegment uSegment = arena.allocate(uvPlaneBytes, M4_CACHE_LINE_ALIGNMENT);
-            MemorySegment vSegment = arena.allocate(uvPlaneBytes, M4_CACHE_LINE_ALIGNMENT);
-            uSegment.fill((byte) 128);
-            vSegment.fill((byte) 128);
+            // 2. U / V プレーン領域（Y領域の直後から末尾まで）を 128 (0x80) で完全初期化 (無色・白黒固定)
+            long uvStartOffset = yPlaneBytes;
+            long uvTotalBytes = totalFrameBytes - yPlaneBytes;
+            this.totalSegment.asSlice(uvStartOffset, uvTotalBytes).fill((byte) 128);
 
-            // 3. YUV420P Frame の構築 (3プレーン直結)
-            this.reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 3);
+            // 3. 単一の連続 ByteBuffer を Frame.image[0] に直結 (JavaCV の仕様に完全一致)
+            this.reusableFrame = new Frame(imgWidth, imgHeight, Frame.DEPTH_UBYTE, 1);
             this.reusableFrame.imageStride = (int) alignedRowBytesY;
-            this.reusableFrame.image = new ByteBuffer[] {
-                    this.ySegment.asByteBuffer(),
-                    uSegment.asByteBuffer(),
-                    vSegment.asByteBuffer()
-            };
+            this.reusableFrame.image = new ByteBuffer[] { this.totalSegment.asByteBuffer() };
         }
 
         public void writeFullRow(MemorySegment inputSegment, long inputOffset, int bytesCount) throws Exception {
             long writeOffset = (long) currentRowInFrame * alignedRowBytesY;
 
             if (duplicateFactor == 4) {
-                // df=4: 1バイト -> 32バイト (4 long) を Y プレーンへ直書き
                 for (int i = 0; i < bytesCount; i++) {
                     int val = inputSegment.get(ValueLayout.JAVA_BYTE, inputOffset + i) & 0xFF;
-                    int lutBase = val << 2; // * 4
+                    int lutBase = val << 2;
 
-                    ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset,      DF4_Y_PLANE_LUT[lutBase]);
-                    ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 8,  DF4_Y_PLANE_LUT[lutBase + 1]);
-                    ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 16, DF4_Y_PLANE_LUT[lutBase + 2]);
-                    ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 24, DF4_Y_PLANE_LUT[lutBase + 3]);
+                    totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset,      DF4_Y_PLANE_LUT[lutBase]);
+                    totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 8,  DF4_Y_PLANE_LUT[lutBase + 1]);
+                    totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 16, DF4_Y_PLANE_LUT[lutBase + 2]);
+                    totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 24, DF4_Y_PLANE_LUT[lutBase + 3]);
 
                     writeOffset += 32;
                 }
@@ -257,16 +251,16 @@ public class FilesToVideosTransformerTask extends TransformerTask {
 
             if (duplicateFactor == 4) {
                 int lutBase = val << 2;
-                ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset,      DF4_Y_PLANE_LUT[lutBase]);
-                ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 8,  DF4_Y_PLANE_LUT[lutBase + 1]);
-                ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 16, DF4_Y_PLANE_LUT[lutBase + 2]);
-                ySegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 24, DF4_Y_PLANE_LUT[lutBase + 3]);
+                totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset,      DF4_Y_PLANE_LUT[lutBase]);
+                totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 8,  DF4_Y_PLANE_LUT[lutBase + 1]);
+                totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 16, DF4_Y_PLANE_LUT[lutBase + 2]);
+                totalSegment.set(ValueLayout.JAVA_LONG_UNALIGNED, writeOffset + 24, DF4_Y_PLANE_LUT[lutBase + 3]);
                 currentPixelInRow += 32;
             } else {
                 for (int bit = 7; bit >= 0; bit--) {
                     byte yVal = ((val & (1 << bit)) != 0) ? (byte) 0 : (byte) 255;
                     for (int f = 0; f < duplicateFactor; f++) {
-                        ySegment.set(ValueLayout.JAVA_BYTE, writeOffset++, yVal);
+                        totalSegment.set(ValueLayout.JAVA_BYTE, writeOffset++, yVal);
                     }
                 }
                 currentPixelInRow += (duplicateFactor << 3);
@@ -282,17 +276,17 @@ public class FilesToVideosTransformerTask extends TransformerTask {
             long firstRowOffset = (long) currentRowInFrame * alignedRowBytesY;
             currentRowInFrame++;
 
-            // 縦方向拡大 (Yプレーン内の Native 高速複製)
+            // 縦方向拡大: Yプレーン内 Native ダイレクト高速コピー
             if (duplicateFactor > 1) {
-                MemorySegment firstRowSlice = ySegment.asSlice(firstRowOffset, rowSizeBytesY);
                 for (int r = 1; r < duplicateFactor; r++) {
                     long nextRowOffset = (long) currentRowInFrame * alignedRowBytesY;
-                    ySegment.asSlice(nextRowOffset, rowSizeBytesY).copyFrom(firstRowSlice);
+                    MemorySegment.copy(totalSegment, ValueLayout.JAVA_BYTE, firstRowOffset,
+                                       totalSegment, ValueLayout.JAVA_BYTE, nextRowOffset, rowSizeBytesY);
                     currentRowInFrame++;
                 }
             }
 
-            // 【超重要】AV_PIX_FMT_YUV420P で録画 -> sws_scale を 100% バイパス！
+            // 【完全白黒 YUV420P】sws_scale 完全バイパス
             if (currentRowInFrame >= imgHeight) {
                 videoRecorder.record(reusableFrame, AV_PIX_FMT_YUV420P);
                 if (taskStatistics instanceof io.github.eoinkanro.filestovideosconverter.transformer.task.TaskStatistics stats) {
@@ -306,7 +300,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
             if (currentPixelInRow > 0) {
                 long writeOffset = (long) currentRowInFrame * alignedRowBytesY + currentPixelInRow;
                 long remainingBytes = rowSizeBytesY - currentPixelInRow;
-                ySegment.asSlice(writeOffset, remainingBytes).fill(PADDING_BYTE);
+                totalSegment.asSlice(writeOffset, remainingBytes).fill(PADDING_BYTE);
                 currentPixelInRow = 0;
                 commitRow();
             }
@@ -315,7 +309,7 @@ public class FilesToVideosTransformerTask extends TransformerTask {
                 if (currentRowInFrame < imgHeight) {
                     long offsetBytes = (long) currentRowInFrame * alignedRowBytesY;
                     long lengthBytes = (imgHeight - currentRowInFrame) * alignedRowBytesY;
-                    ySegment.asSlice(offsetBytes, lengthBytes).fill(PADDING_BYTE);
+                    totalSegment.asSlice(offsetBytes, lengthBytes).fill(PADDING_BYTE);
                 }
                 videoRecorder.record(reusableFrame, AV_PIX_FMT_YUV420P);
                 if (taskStatistics instanceof io.github.eoinkanro.filestovideosconverter.transformer.task.TaskStatistics stats) {
